@@ -1,0 +1,12 @@
+# Molecule AI workspace runtime — shared infrastructure (Gitea PyPI registry)
+molecule-ai-workspace-runtime>=0.2.0
+
+# python-multipart band-aid (mc#1578) — Starlette multipart parse on canvas upload.
+python-multipart>=0.0.27
+
+# NOTE: google-adk is installed in the Dockerfile from public PyPI (separate
+# --index-url) because the Gitea PyPI index above does not mirror it.
+# google-adk[mcp]==2.1.0  -> LlmAgent + Runner + McpToolset. NEVER the [a2a]
+# extra (it pins a2a-sdk<0.4, incompatible with the platform's a2a-sdk>=1.0).
+# FOLLOW-UP (RFC internal#730 Phase 0): switch to the molecule-ai/adk-python
+# fork (don't rely on upstream) once it's published to the Gitea PyPI registry.

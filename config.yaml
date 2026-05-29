@@ -1,0 +1,46 @@
+name: Google ADK Agent
+description: >-
+  Gemini agent powered by Google's Agent Development Kit (ADK). ADK is the
+  agent engine (LlmAgent + Runner); platform tools (delegate / memory / peers /
+  messaging) reach the agent via ADK's native MCPToolset pointed at the
+  workspace a2a_mcp_server. BYOK: set GOOGLE_API_KEY (AI Studio) — or Vertex
+  via GOOGLE_GENAI_USE_VERTEXAI=1 + GOOGLE_CLOUD_PROJECT.
+version: 1.0.0
+tier: 2
+
+runtime: google-adk
+
+runtime_config:
+  model: google_genai:gemini-2.5-pro
+  required_env:
+    - GOOGLE_API_KEY
+
+# Top-level models[] — the authoritative servability source for this runtime
+# (langgraph-style; the registry projection is a subset of this).
+models:
+  - id: google_genai:gemini-2.5-pro
+    name: Gemini 2.5 Pro (Google AI Studio)
+    required_env: [GOOGLE_API_KEY]
+  - id: google_genai:gemini-2.5-flash
+    name: Gemini 2.5 Flash (Google AI Studio)
+    required_env: [GOOGLE_API_KEY]
+  - id: vertex:gemini-2.5-pro
+    name: Gemini 2.5 Pro (Vertex AI)
+    required_env: [GOOGLE_CLOUD_PROJECT]
+
+prompt_files:
+  - system-prompt.md
+
+a2a:
+  port: 8000
+  streaming: true
+
+env:
+  required:
+    - GOOGLE_API_KEY
+  optional:
+    - GOOGLE_GENAI_USE_VERTEXAI
+    - GOOGLE_CLOUD_PROJECT
+    - GOOGLE_CLOUD_LOCATION
+
+template_schema_version: 1

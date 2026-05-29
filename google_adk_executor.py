@@ -1,0 +1,189 @@
+"""A2A executor for the google-adk runtime.
+
+Molecule-authored (NOT ADK's native ``A2aAgentExecutor``): ADK pins
+``a2a-sdk<0.4`` for its a2a layer, while the platform's A2A server is on
+``a2a-sdk>=1.0`` — incompatible. So we use ADK purely as the agent engine
+(``LlmAgent`` + ``Runner`` + ``McpToolset``) and bridge its ``Runner``
+event stream onto the platform's a2a-1.x ``EventQueue``/``TaskUpdater``
+ourselves — the same shape ``LangGraphA2AExecutor`` uses.
+
+Platform-citizen scope (RFC internal#730, approved): the A2A event
+contract + heartbeat task accounting (``set_current_task``) are
+implemented here because they are load-bearing (online/busy/offline
+recovery + scheduler concurrency). OWASP compliance, OTEL spans, and the
+Temporal durable wrapper are OFF/dormant in production today, so they are
+deferred (gated no-op) — see the RFC's "out of scope" section.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from collections.abc import Iterable
+
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — unit-tested without ADK, a2a, a live platform, or a key.
+# ADK Event/Content/Part objects are duck-typed (``.content.parts[*].text``
+# + ``.is_final_response()``), so tests drive lightweight fakes.
+# ---------------------------------------------------------------------------
+
+def extract_event_text(event) -> list[str]:
+    """Return the non-empty text parts an ADK event carries.
+
+    Only ``text`` parts surface; function-call / function-response parts
+    (tool traffic) are skipped so raw tool JSON never leaks into A2A output.
+    """
+    content = getattr(event, "content", None)
+    parts = getattr(content, "parts", None) or []
+    texts: list[str] = []
+    for part in parts:
+        text = getattr(part, "text", None)
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return texts
+
+
+def is_final(event) -> bool:
+    """True when the event is ADK's terminal response for the turn."""
+    fn = getattr(event, "is_final_response", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
+def collect_response_text(events: Iterable, *, on_chunk=None) -> str:
+    """Drain events (sync iterable), optionally stream chunks, return final text.
+
+    The text of the ``is_final_response()`` event wins. If no event is flagged
+    final (defensive), fall back to the concatenation of everything streamed,
+    so a non-empty model output is never dropped.
+    """
+    final_text = ""
+    streamed: list[str] = []
+    for event in events:
+        texts = extract_event_text(event)
+        if is_final(event):
+            final_text = "".join(texts)
+        else:
+            for t in texts:
+                streamed.append(t)
+                if on_chunk is not None:
+                    on_chunk(t)
+    return final_text or "".join(streamed)
+
+
+def sanitize_error(exc: Exception) -> str:
+    """Turn a raw SDK exception into an A2A-safe, single-line, tagged string.
+
+    Never leak a Google SDK stack trace to the calling agent. Mirrors the
+    OFFSEC-003 sanitisation the langgraph/claude executors apply.
+    """
+    msg = str(exc).strip() or exc.__class__.__name__
+    first_line = msg.splitlines()[0][:300]
+    return f"[A2A_ERROR] google-adk runtime error: {first_line}"
+
+
+# ---------------------------------------------------------------------------
+# Executor
+# ---------------------------------------------------------------------------
+
+class GoogleADKA2AExecutor(AgentExecutor):
+    """Bridges an ADK ``Runner`` to the platform's a2a-1.x event model.
+
+    One ADK session per A2A ``context_id`` (created lazily). Emits a
+    ``working`` status, streams intermediate text as artifacts, and returns
+    the final response as a terminal A2A message. Heartbeat task accounting
+    via ``set_current_task`` brackets every turn.
+    """
+
+    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None):
+        self._runner = runner
+        self._app_name = app_name
+        self._user_id = user_id
+        self._model = model
+        self._heartbeat = heartbeat
+
+    async def _ensure_session(self, session_id: str) -> None:
+        svc = self._runner.session_service
+        existing = await svc.get_session(
+            app_name=self._app_name, user_id=self._user_id, session_id=session_id
+        )
+        if existing is None:
+            await svc.create_session(
+                app_name=self._app_name, user_id=self._user_id, session_id=session_id
+            )
+
+    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        from a2a.helpers import new_text_message
+        from a2a.server.tasks import TaskUpdater
+        from a2a.types import Part
+        from google.genai import types
+
+        from molecule_runtime.adapters.shared_runtime import (
+            brief_task,
+            extract_message_text,
+            set_current_task,
+        )
+
+        user_input = extract_message_text(context)
+        if not user_input:
+            await event_queue.enqueue_event(
+                new_text_message("Error: message contained no text content.")
+            )
+            return
+
+        task_id = context.task_id or str(uuid.uuid4())
+        context_id = context.context_id or str(uuid.uuid4())
+        updater = TaskUpdater(event_queue, task_id, context_id)
+
+        # Heartbeat task accounting — load-bearing (online/busy/offline + scheduler).
+        await set_current_task(self._heartbeat, brief_task(user_input))
+        try:
+            await self._ensure_session(context_id)
+            await updater.start_work()
+
+            new_message = types.Content(role="user", parts=[types.Part(text=user_input)])
+            events = self._runner.run_async(
+                user_id=self._user_id, session_id=context_id, new_message=new_message
+            )
+            final_text = await self._drain(events, updater, Part)
+            await event_queue.enqueue_event(new_text_message(final_text or "(no response)"))
+        except Exception as exc:  # noqa: BLE001 — SDK errors are sanitised, never raised to A2A
+            logger.exception("google-adk execute failed for context %s", context_id)
+            await event_queue.enqueue_event(new_text_message(sanitize_error(exc)))
+        finally:
+            # Clear the in-flight task so heartbeat active_tasks decrements.
+            await set_current_task(self._heartbeat, None)
+
+    async def _drain(self, events, updater, Part) -> str:
+        """Async-drain ADK's event stream, emit artifacts, return final text."""
+        final_text = ""
+        streamed: list[str] = []
+        artifact_id = str(uuid.uuid4())
+        has_streamed = False
+        async for event in events:
+            texts = extract_event_text(event)
+            if is_final(event):
+                final_text = "".join(texts)
+            else:
+                for t in texts:
+                    streamed.append(t)
+                    await updater.add_artifact(
+                        parts=[Part(text=t)], artifact_id=artifact_id, append=has_streamed
+                    )
+                    has_streamed = True
+        return final_text or "".join(streamed)
+
+    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # ADK's in-memory Runner has no mid-run cancellation hook; the A2A
+        # framework marks the task cancelled. Nothing to tear down here.
+        logger.info("google-adk: cancel requested for context %s", getattr(context, "context_id", "?"))
