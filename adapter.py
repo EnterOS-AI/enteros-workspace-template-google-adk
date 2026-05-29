@@ -17,13 +17,21 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING
 
 from a2a.server.agent_execution import AgentExecutor
 
 from molecule_runtime.adapters.base import AdapterConfig, BaseAdapter
 
-from _routing import ResolvedModel, resolve_model, vertex_location
-from google_adk_executor import GoogleADKA2AExecutor
+# Sibling modules (_routing, google_adk_executor) are top-level files in this
+# template, NOT installed packages. At runtime the container puts /app on
+# sys.path (ADAPTER_MODULE=adapter), so they import fine — but tooling that
+# imports adapter.py directly (the `Template validation (runtime)` validator)
+# has no such path entry. Import them LAZILY inside the methods that use them
+# (the claude-code template pattern) so module load never fails. The
+# ResolvedModel annotation is type-check-only (PEP 563 strings via __future__).
+if TYPE_CHECKING:
+    from _routing import ResolvedModel
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +77,8 @@ class GoogleADKAdapter(BaseAdapter):
 
     async def setup(self, config: AdapterConfig) -> None:
         """Resolve + validate the model and credentials before any task runs."""
+        from _routing import resolve_model, vertex_location
+
         resolved = resolve_model(config.model, os.environ)
         self._resolved = resolved
         if resolved.backend == "vertex":
@@ -109,6 +119,8 @@ class GoogleADKAdapter(BaseAdapter):
         from google.adk.agents import LlmAgent
         from google.adk.runners import Runner
         from google.adk.sessions import InMemorySessionService
+
+        from google_adk_executor import GoogleADKA2AExecutor
 
         if self._resolved is None:
             await self.setup(config)
