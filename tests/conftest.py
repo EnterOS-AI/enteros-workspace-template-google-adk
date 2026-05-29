@@ -3,8 +3,9 @@
 `adapter.py` imports at module load:
   - molecule_runtime.adapters.base (BaseAdapter, AdapterConfig, RuntimeCapabilities)
   - molecule_runtime.plugins (lazy in setup(), but stubbed proactively)
-  - a2a.server.agent_execution (AgentExecutor)
-  - claude_sdk_executor (lazy in create_executor(), stubbed proactively)
+  - a2a.server.agent_execution (AgentExecutor, RequestContext)
+  - a2a.server.events (EventQueue)
+  - google_adk_executor (real sibling module; imports the a2a stubs above)
 
 In production those arrive transitively via molecule-ai-workspace-runtime.
 The CI runner only installs `pytest pytest-asyncio pyyaml`, so the import
@@ -39,6 +40,8 @@ class _StubAdapterConfig:
     config_path: str = "/tmp/configs"
     system_prompt: str = ""
     heartbeat: object = None
+    workspace_id: str = ""
+    model: str = "google_genai:gemini-2.5-pro"
 
 
 class _StubBaseAdapter:
