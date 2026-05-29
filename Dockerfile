@@ -1,15 +1,35 @@
 FROM python:3.11-slim
 
-# System deps: gosu (drop-priv entrypoint), git (agent autonomy against the
-# Gitea middleman), curl + ca-certificates. Tier-2 runtime — NO host
-# escalation (no sudo/docker/nsenter), NO node/npm (ADK is pure Python).
+# System deps. gosu (drop-priv entrypoint), git (agent autonomy), curl +
+# ca-certificates. Plus the UNIFORM T4 privilege-contract leg (sudo +
+# util-linux/nsenter + docker.io CLI): every template must satisfy the live
+# T4 conformance gate (RFC internal#456 §11), even though google-adk defaults
+# to tier 2 — the gate boots the image under tier-4 provisioner flags and
+# asserts host-root reach. No node/npm (ADK is pure Python).
+# docker-cli is explicit: docker.io 26.1.5+ split the `/usr/bin/docker` client
+# into the `docker-cli` package (a Recommends), which --no-install-recommends
+# drops — the T4 conformance probe needs the client for docker_socket_reachable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl gosu ca-certificates git \
+    curl gosu ca-certificates git sudo util-linux docker.io docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 # Agent user — runs as uid-1000; /configs/.auth_token must stay agent-owned
 # (Hermes list_peers-401 class). entrypoint.sh enforces ownership.
-RUN useradd -u 1000 -m -s /bin/bash agent
+# /agent-home is the agent-writable home the T4 contract probes.
+RUN useradd -u 1000 -m -s /bin/bash agent && \
+    mkdir -p /agent-home && chown agent:agent /agent-home
+
+# T4 escalation leg (RFC internal#456 §9/§11): wired path uid-1000 agent →
+# host root inside the provisioner's --privileged --pid=host -v /:/host
+# -v docker.sock container. NOPASSWD sudoers (visudo-validated) + docker group.
+# Additive: does NOT change the agent uid or /configs token ownership.
+RUN set -eux; \
+    printf 'agent ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/agent-t4; \
+    chmod 0440 /etc/sudoers.d/agent-t4; \
+    visudo -cf /etc/sudoers.d/agent-t4; \
+    groupadd -f docker; \
+    usermod -aG docker agent; \
+    id agent
 
 WORKDIR /app
 
