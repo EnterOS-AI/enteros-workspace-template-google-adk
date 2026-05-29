@@ -16,19 +16,23 @@ WORKDIR /app
 # RUNTIME_VERSION forwarded from the publish workflow busts the pip cache key
 # on cascade builds. PIP_INDEX_URL = the Gitea PyPI registry (runtime wheel).
 ARG RUNTIME_VERSION=
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+# Gitea registry is an EXTRA index (not the primary): it serves the private
+# molecule-ai-workspace-runtime wheel; its transitive deps (pyyaml, starlette,
+# python-multipart, …) and google-adk resolve from PyPI. Using it as
+# --index-url alone fails (the registry is not a PyPI proxy).
+ARG PIP_EXTRA_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
+RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
-# Google ADK from public PyPI (the Gitea index does not mirror it). [mcp]
-# pulls the MCP client for McpToolset; we NEVER install the [a2a] extra (it
-# pins a2a-sdk<0.4, incompatible with the platform's a2a-sdk>=1.0).
+# Google ADK from PyPI. [mcp] pulls the MCP client for McpToolset; we NEVER
+# install the [a2a] extra (it pins a2a-sdk<0.4, incompatible with the
+# platform's a2a-sdk>=1.0).
 # FOLLOW-UP (RFC #730 Phase 0): switch to the molecule-ai/adk-python fork.
-RUN pip install --no-cache-dir --index-url https://pypi.org/simple "google-adk[mcp]==2.1.0"
+RUN pip install --no-cache-dir "google-adk[mcp]==2.1.0"
 
 # Adapter code (top-level modules; /app is on sys.path, ADAPTER_MODULE=adapter)
 COPY adapter.py google_adk_executor.py _routing.py __init__.py config.yaml ./
