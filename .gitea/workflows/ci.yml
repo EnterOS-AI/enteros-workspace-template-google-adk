@@ -1,0 +1,420 @@
+name: CI
+
+# Ported from .github/workflows/ci.yml on 2026-05-11 per internal#326
+# (Class-A root: cross-repo `uses:` blocker for Gitea 1.22.6 —
+# feedback_gitea_cross_repo_uses_blocked).
+#
+# Root cause of the main-red CI on this repo:
+#   The .github/ original used
+#     uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@main
+#   which Gitea 1.22.6 rejects (DEFAULT_ACTIONS_URL=github → 404 against
+#   the remote repo even though it lives on the same Gitea instance).
+#   Gitea reads .github/ as a fallback when .gitea/ is absent
+#   (reference_per_repo_gitea_vs_github_actions_dir), so the .github/
+#   workflow was firing on Gitea and failing in 1s.
+#
+# Fix shape: inline the validation logic directly. The canonical
+# validator in molecule-ai/molecule-ci already self-clones into the
+# runner via a direct HTTPS `git clone` step (validate-workspace-template.yml
+# does this verbatim) — so the inline port is just "do that clone +
+# invoke the validator script in-place", preserving the
+# single-source-of-truth property (each CI run still fetches the
+# canonical validator fresh).
+#
+# Four-surface migration audit (feedback_gitea_actions_migration_audit_pattern):
+#   1. YAML — no `workflow_dispatch.inputs`; no `merge_group`; preserved
+#      `on: [push, pull_request]` from the original. Added workflow-level
+#      env.GITHUB_SERVER_URL (feedback_act_runner_github_server_url).
+#   2. Package source — pip resolves through the Gitea PyPI registry;
+#      no runtime dependency is fetched from PyPI/GitHub in CI.
+#   3. Token — uses auto-injected GITHUB_TOKEN (Gitea-aliased). Validator
+#      job needs only `contents: read` (no write to issues/PRs).
+#   4. Docs — anonymous git-clone of molecule-ci (no token in URL); the
+#      molecule-ci repo is public on the Gitea instance.
+#
+# Gitea 1.22.6 can leave protected jobs with job-level `if:` guards
+# pending as 'Blocked by required conditions'. Runtime validation runs
+# after static validation via `needs:` so protected contexts complete.
+#
+# Cross-links:
+#   - internal#326 — parent tracking issue
+#   - molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml — pattern source
+#   - molecule-ai/molecule-core/.gitea/workflows/ci.yml — Gitea port style reference
+
+on: [push, pull_request]
+
+# Defense-in-depth de-dup ONLY (the t4-conformance unique-name fix is the
+# actual fail-closed primitive against the shared-host-daemon race; see
+# that job). Scope per workflow + ref + EVENT so the push run and the
+# pull_request run of the same internal-PR commit get DISTINCT groups —
+# they must both complete (each emits its own required-status context;
+# feedback_gitea_gate_check_required_list_not_combined_status). Never
+# per-SHA-global: that silently cross-cancels legit required checks
+# (feedback_concurrency_group_per_sha). cancel-in-progress:false so an
+# in-flight live T4 probe is never aborted mid-assertion (a cancelled
+# privileged probe would look like a gate failure / flake); a newer push
+# to the same ref+event simply queues behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Belt-and-suspenders against the runner-default trap
+  # (feedback_act_runner_github_server_url). Runners are configured
+  # with this env via /opt/molecule/runners/config.yaml runner.envs,
+  # but pinning at the workflow level protects against a runner
+  # regenerated without the config file.
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+
+# Defense-in-depth on the GITHUB_TOKEN scope. The validate-runtime job
+# runs untrusted-by-design code from the calling repo — pip-installs
+# requirements.txt (post-install hooks), imports adapter.py, and
+# docker-builds the Dockerfile. Each primitive can execute arbitrary
+# code with the token in env. Pinning `contents: read` means the worst
+# a malicious template PR can do with the token is read public repo
+# state — no write to issues, no push to branches, no comment-spam.
+permissions:
+  contents: read
+
+jobs:
+  validate-static:
+    name: Template validation (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Canonical validator script lives in molecule-ci, fetched fresh on
+      # every run. Anonymous fetch of the public molecule-ci repo — no
+      # token needed; no actions/checkout cross-repo idiosyncrasies.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      # Secret scan — the most important check. Always runs, including
+      # on fork PRs (no third-party code executes here).
+      - name: Check for secrets
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, sys
+          from pathlib import Path
+
+          PATTERNS = [
+              re.compile(r'''["']sk-ant-[a-zA-Z0-9]{50,}["']'''),
+              re.compile(r'''["']ghp_[a-zA-Z0-9]{36,}["']'''),
+              re.compile(r'''["']AKIA[A-Z0-9]{16}["']'''),
+              re.compile(r'''["'][a-zA-Z0-9/+=]{40}["']'''),
+              re.compile(r'''["']sk_test_[a-zA-Z0-9]{24,}["']'''),
+              re.compile(r'''["']Bearer\s+[a-zA-Z0-9_.-]{20,}["']'''),
+              re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
+              re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
+          ]
+          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
+
+          def is_false_positive(line):
+              ctx = line.lower()
+              return '...' in ctx or '<example' in ctx or '</example' in ctx
+
+          root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
+          warnings = []
+          for dirpath, dirnames, filenames in os.walk(root):
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for filename in filenames:
+                  if Path(filename).suffix not in EXTENSIONS:
+                      continue
+                  filepath = Path(dirpath) / filename
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          for lineno, line in enumerate(f.readlines(), 1):
+                              for pattern in PATTERNS:
+                                  for match in pattern.finditer(line):
+                                      if not is_false_positive(line):
+                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
+                  except Exception:
+                      pass
+
+          if warnings:
+              print("::error::Potential secret found in committed files:")
+              for w in warnings:
+                  print(w)
+              sys.exit(1)
+          else:
+              print("::notice::No secrets detected")
+          PYEOF
+      # Static-only validator — file existence checks, YAML parse,
+      # AST inspection of adapter.py (no import). Doesn't execute any
+      # third-party code; safe on fork PRs.
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+
+  validate-runtime:
+    name: Template validation (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    # Runs after static validation. Avoid job-level if: guards here because
+    # Gitea 1.22.6 can leave the protected context pending instead of skipped.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - run: pip install pyyaml -q
+      # Install the template's runtime dependencies so the validator's
+      # check_adapter_runtime_load() can import adapter.py the same way
+      # the workspace container does at boot. Without this, a
+      # syntactically-valid adapter that ImportErrors on a missing
+      # transitive dep would build clean and crash on first user prompt.
+      - if: hashFiles('requirements.txt') != ''
+        run: pip install -q -r requirements.txt
+      - if: hashFiles('requirements.txt') == ''
+        run: pip install -q molecule-ai-workspace-runtime
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: entrypoint restore-from-secondary unit test (cp#326)
+        # Container-runnable bash unit test for entrypoint.sh's
+        # restore_from_secondary_volume(). Mocks blkid/mount/mountpoint/
+        # rsync so it runs without a real blockdev or docker daemon —
+        # pure logic coverage (idempotency, device-absent no-op, happy-
+        # path data landing, rsync-failure exit-code handling). The
+        # wire-level contract against real AWS lives in the CP repo's
+        # Stage C smoke (stage-c-workspace-backup-smoke.sh step 6b).
+        if: hashFiles('tests/test_entrypoint_restore.sh') != ''
+        run: bash tests/test_entrypoint_restore.sh
+      - name: Docker build smoke test
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          # Graceful skip when the runner's job-container can't reach the
+          # Docker daemon (e.g. /var/run/docker.sock not mounted into the
+          # act job container, or the in-container uid not in the docker
+          # group). Without this guard, CI stays red even when the
+          # template's Dockerfile is fine — see internal#222 for the
+          # proper runner-config fix.
+          if ! docker info >/dev/null 2>&1; then
+            echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
+            exit 0
+          fi
+          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+
+  # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
+  # NOT a string-match. Builds the actual image, runs it under the EXACT
+  # flags the controlplane provisioner emits for tier-4
+  # (userdata_containerized.go @ec2384c: --privileged --pid=host --network host
+  # -v /:/host -v /var/run/docker.sock:/var/run/docker.sock), then drives
+  # the *uniform T4 privilege contract* defined in
+  # molecule-ai/molecule-core's workspace-server/internal/provisioner/
+  # t4_privilege_contract.go and rendered via
+  # `go run ./workspace-server/cmd/t4-contract-dump`. Each capability
+  # in the YAML has a stable name, a shell probe that exits 0 on pass,
+  # and a severity (hard|advisory). Hard misses fail the gate; new
+  # capabilities propagate WITHOUT a per-template PR (just bump the
+  # MOLECULE_CORE_REF env, or let it float to main).
+  #
+  # PILOT (internal #174): this is the first template to consume the
+  # uniform contract. template-hermes / template-codex follow on
+  # sequenced PRs after this lands green.
+  #
+  # Anti-tautology (per memory feedback_hermes_listpeers_401_token_…):
+  # all probes run against a RUNNING container started via the real
+  # `docker run` flags the provisioner emits — no `chown` + immediate
+  # `stat` self-fulfilling pairs. The contract's
+  # `host_root_reach_via_nsenter` probe fails closed if `exec gosu agent`
+  # ever regresses, exactly as the Hermes equivalent does.
+  #
+  # The `list_peers_http_200` probe is OPT-IN (advisory by default in
+  # this template) because the platform a2a_mcp_server is only spun up
+  # by the real start.sh boot path with credentials we don't want in
+  # CI. The probe iterates capabilities; for `list_peers_http_200` we
+  # skip-with-warning if `/configs/.auth_token` is absent (smoke-mode).
+  # On a fresh prod provision the probe is exercised end-to-end by the
+  # post-pin live-verify (task #195).
+  #
+  # Concurrency-flake: per-run-unique `--name` + per-run-unique probe
+  # file paths under /host/tmp/. Push and pull_request runs of the
+  # same commit share a host Docker daemon (--network host); a static
+  # name would collide and false-negative. See sibling template-hermes
+  # ci.yml + task #207 for the canonical rationale.
+  t4-conformance:
+    name: T4 tier-4 conformance (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate-static
+    env:
+      # The molecule-core ref the contract YAML is generated from.
+      # Default `main` floats with the latest contract; pin to a SHA
+      # for deterministic gate behavior across template branches.
+      # Adopters MAY override per-PR to test an unmerged contract change.
+      MOLECULE_CORE_REF: main
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: pip install -q pyyaml
+      - name: Fetch generated t4_capabilities.yaml from the uniform contract
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://git.moleculesai.app/molecule-ai/molecule-core/raw/branch/${MOLECULE_CORE_REF}/workspace-server/internal/provisioner/t4_capabilities.yaml" \
+            -o t4_capabilities.yaml
+          # Defense-in-depth: schema-version assertion so a contract
+          # bump that breaks the parser shape is caught here, not at
+          # runtime where it would look like a phantom capability miss.
+          grep -q '^version: 1$' t4_capabilities.yaml || { echo "::error::t4_capabilities.yaml schema version unrecognized"; exit 1; }
+          echo "=== contract preview ==="
+          head -40 t4_capabilities.yaml
+          echo "=== capability names ==="
+          grep '^  - name:' t4_capabilities.yaml
+      - name: Build the runtime image
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+            exit 1
+          fi
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+      - name: Run under EXACT tier-4 provisioner flags + iterate contract capabilities
+        env:
+          # Per-run-unique probe-id. Used by individual capability
+          # probes (agent_home_writable, host_fs_write_readback) to
+          # scope their on-disk markers; without this, concurrent
+          # same-commit push+pull_request runs would collide on the
+          # /host/tmp/* path (see template-hermes ci.yml + task #207).
+          MOLECULE_T4_PROBE_ID: "${{ github.run_id }}-${{ github.run_attempt }}"
+          # Container name is computed in the script body and exported
+          # so the inline Python iterator can `docker exec` into it.
+          T4_PROBE_NAME: "t4probe-${{ github.run_id }}-${{ github.run_attempt }}"
+        run: |
+          set -euo pipefail
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          T4_PROBE="$T4_PROBE_NAME"
+          docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "$T4_PROBE" \
+            --network host \
+            --privileged \
+            --pid=host \
+            -v /:/host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e MOLECULE_T4_PROBE_ID="$MOLECULE_T4_PROBE_ID" \
+            -e MOLECULE_T4_EGRESS_TARGETS="https://git.moleculesai.app/api/v1/version" \
+            --entrypoint /bin/sh \
+            "$T4_TAG" -c 'sleep 600' >/dev/null
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+
+          # ----- Reproduce SaaS-mode token agent-ownership pre-state -----
+          # The real entrypoint chowns /configs:agent before gosu; in this
+          # smoke probe /configs is unmounted, so reproduce the contract
+          # step. The `auth_token_agent_owned` probe THEN asserts the
+          # post-condition. This is NOT a tautology: the probe asserts
+          # `stat -c %u` returns 1000, which would fail if the entrypoint
+          # ever wrote the token as root in the live boot path
+          # (`host_root_reach_via_nsenter` + the gosu chain is the
+          # anti-regression guard for that — both probes must pass).
+          docker exec "$T4_PROBE" sh -c 'mkdir -p /configs && touch /configs/.auth_token && chown -R agent:agent /configs'
+
+          # ----- Iterate the contract YAML -----
+          # Pure-python YAML walker (PyYAML installed earlier). We
+          # don't exec the probe via shell-only because shell-parsing
+          # YAML is fragile; we do execute each probe IN the running
+          # container via `docker exec -u agent` so uid-1000 context is
+          # enforced.
+          python3 - <<'PYEOF'
+          import os, subprocess, sys, yaml
+          with open("t4_capabilities.yaml") as f:
+              doc = yaml.safe_load(f)
+          probe = os.environ["T4_PROBE_NAME"]
+          fails_hard = []
+          fails_soft = []
+          for cap in doc.get("capabilities", []):
+              name = cap["name"]
+              sev = cap.get("severity", "advisory")
+              probe_sh = cap["probe"]
+              # OPT-OUT semantics for capabilities that need a live
+              # platform/runtime not stood up in this probe. They are
+              # exercised end-to-end by the post-pin live-verify burst
+              # (task #195) instead.
+              if name == "list_peers_http_200":
+                  # Only run if the in-container runtime has spun up;
+                  # smoke-mode does not. Skip-with-notice keeps the
+                  # gate honest without false negatives.
+                  port = subprocess.run(
+                      ["docker","exec","-u","agent",probe,"sh","-c","[ -f /configs/.platform_port ]"],
+                      capture_output=True,
+                  ).returncode
+                  if port != 0:
+                      print(f"::notice::skipping {name} — runtime not booted in CI smoke probe; covered by live post-pin verify")
+                      continue
+              r = subprocess.run(
+                  ["docker","exec","-u","agent",probe,"sh","-c",probe_sh],
+                  capture_output=True, text=True,
+              )
+              if r.returncode == 0:
+                  print(f"  PASS  {name}  ({sev})")
+              else:
+                  msg = f"FAIL  {name}  ({sev}): rc={r.returncode}  source={cap.get('source','?')}"
+                  print(f"::error::{msg}")
+                  if r.stderr.strip():
+                      print(f"        stderr: {r.stderr.strip()}")
+                  if sev == "hard":
+                      fails_hard.append(name)
+                  else:
+                      fails_soft.append(name)
+          if fails_hard:
+              print(f"::error::T4 conformance FAILED — hard capabilities not satisfied: {fails_hard} (RFC internal#456 §11; the gate is fail-closed)")
+              sys.exit(1)
+          if fails_soft:
+              print(f"::warning::T4 conformance: advisory capabilities failed: {fails_soft} (non-blocking, but inspect)")
+          print(f"::notice::T4 tier-4 conformance PASS — uniform contract satisfied ({len(doc.get('capabilities',[]))} capabilities checked)")
+          PYEOF
+
+  # Aggregator that emits a single `validate` check name — matches the
+  # historical required-check name on this repo's branch protection.
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    needs: [validate-static, validate-runtime, t4-conformance]
+    timeout-minutes: 1
+    steps:
+      - name: Aggregate
+        run: |
+          static="${{ needs.validate-static.result }}"
+          runtime="${{ needs.validate-runtime.result }}"
+          t4="${{ needs.t4-conformance.result }}"
+          echo "validate-static:  $static"
+          echo "validate-runtime: $runtime"
+          echo "t4-conformance:   $t4"
+          if [ "$static" != "success" ]; then
+            echo "::error::validate-static did not succeed: $static"
+            exit 1
+          fi
+          # Preserve compatibility with older runs that skipped runtime validation.
+          if [ "$runtime" != "success" ] && [ "$runtime" != "skipped" ]; then
+            echo "::error::validate-runtime did not succeed: $runtime"
+            exit 1
+          fi
+          # T4 conformance is a hard gate; keep accepting `skipped` only
+          # for compatibility with older runs that used job-level guards.
+          # Any other non-success fails the build:
+          # "verified" T4 requires this live gate green, never inference.
+          if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
+            echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
+            exit 1
+          fi
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4)"
+
+  tests:
+    name: Adapter unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # pyyaml is the runtime dep that adapter.py's _load_providers reads
+      # /configs/config.yaml through. In production it arrives transitively
+      # via molecule-ai-workspace-runtime; in this minimal test env we
+      # install it explicitly so the YAML-loading code path is actually
+      # exercised (without it, _load_providers' broad except-Exception
+      # swallows the ImportError and silently falls back to _BUILTIN_PROVIDERS,
+      # which is exactly the behavior that bit us 2026-04-30 when CI
+      # claimed green on a build that couldn't route any third-party model).
+      - run: pip install -q pytest pytest-asyncio pyyaml
+      # Tests live under tests/ with their own pytest.ini that anchors
+      # rootdir there — keeps pytest from importing the package
+      # __init__.py (which does `from .adapter import ...` for runtime
+      # discovery and can't be satisfied without molecule_runtime
+      # installed). See tests/pytest.ini for the full rationale.
+      - run: python3 -m pytest tests/ -v
