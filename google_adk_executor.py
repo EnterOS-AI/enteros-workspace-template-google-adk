@@ -209,10 +209,27 @@ class GoogleADKA2AExecutor(AgentExecutor):
                 user_id=self._user_id, session_id=context_id, new_message=new_message
             )
             final_text = await self._drain(events, updater, Part)
-            await event_queue.enqueue_event(new_text_message(final_text or "(no response)"))
+            # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
+            # executor is in TASK MODE, where a raw Message enqueue is rejected
+            # ("Received Message object in task mode. Use TaskStatusUpdateEvent
+            # or TaskArtifactUpdateEvent instead.", JSON-RPC -32603 — e2e-found
+            # 2026-05-30). The terminal reply must go through updater.complete(),
+            # which wraps the Message in a COMPLETED TaskStatusUpdateEvent.
+            # Mirrors the platform reference executor (a2a_executor.py:674).
+            await updater.complete(
+                message=new_text_message(
+                    final_text or "(no response)", task_id=task_id, context_id=context_id
+                )
+            )
         except Exception as exc:  # noqa: BLE001 — SDK errors are sanitised, never raised to A2A
             logger.exception("google-adk execute failed for context %s", context_id)
-            await event_queue.enqueue_event(new_text_message(sanitize_error(exc)))
+            # Task mode: terminal errors publish a FAILED TaskStatusUpdateEvent
+            # via updater.failed(), not a raw Message enqueue (same -32603 rule).
+            await updater.failed(
+                message=new_text_message(
+                    sanitize_error(exc), task_id=task_id, context_id=context_id
+                )
+            )
         finally:
             # Clear the in-flight task so heartbeat active_tasks decrements.
             await set_current_task(self._heartbeat, None)
