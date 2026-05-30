@@ -1,6 +1,17 @@
 # Molecule AI workspace runtime — shared infrastructure (Gitea PyPI registry)
 molecule-ai-workspace-runtime>=0.2.0
 
+# Pin a2a-sdk to 1.0.3 — the version the rest of the fleet actually runs
+# (verified live: claude-code workspaces are on 1.0.3 and extract incoming
+# text fine). The runtime wheel only constrains a2a-sdk>=1.0,<2.0, so an
+# unpinned build drifted up to 1.1.0, where the platform helper
+# extract_message_text(context) stopped finding the message parts → every
+# google-adk turn replied "message contained no text content" (e2e-found
+# 2026-05-29). 1.0.3 is also the memory-verified combo that coexists with
+# google-adk[mcp]==2.1.0. (The executor also now prefers context.get_user_input()
+# so a future SDK bump can't silently re-break this.)
+a2a-sdk[http-server]==1.0.3
+
 # python-multipart band-aid (mc#1578) — Starlette multipart parse on canvas upload.
 python-multipart>=0.0.27
 

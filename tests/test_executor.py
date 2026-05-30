@@ -3,9 +3,44 @@
 from google_adk_executor import (
     collect_response_text,
     extract_event_text,
+    extract_incoming_text,
     is_final,
     sanitize_error,
 )
+
+
+class _Ctx:
+    """Duck-typed RequestContext: get_user_input may return text, raise, or be absent."""
+    def __init__(self, value=None, raises=False, absent=False):
+        self._value = value
+        self._raises = raises
+        if absent:
+            # simulate an SDK whose RequestContext lacks get_user_input
+            del self.get_user_input
+
+    def get_user_input(self):
+        if self._raises:
+            raise RuntimeError("SDK boom")
+        return self._value
+
+
+def test_incoming_text_prefers_get_user_input():
+    # fallback must NOT run when get_user_input yields text (the a2a-sdk 1.1.0 fix)
+    def _fallback(_):
+        raise AssertionError("fallback should not be called")
+    assert extract_incoming_text(_Ctx(value="  hello  "), _fallback) == "hello"
+
+
+def test_incoming_text_falls_back_when_get_user_input_empty():
+    assert extract_incoming_text(_Ctx(value=""), lambda _c: "from-parts") == "from-parts"
+
+
+def test_incoming_text_falls_back_when_get_user_input_raises():
+    assert extract_incoming_text(_Ctx(raises=True), lambda _c: "from-parts") == "from-parts"
+
+
+def test_incoming_text_empty_when_both_empty():
+    assert extract_incoming_text(_Ctx(value=None), lambda _c: "") == ""
 
 
 class _Part:

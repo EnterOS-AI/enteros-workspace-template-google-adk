@@ -92,6 +92,24 @@ def sanitize_error(exc: Exception) -> str:
     return f"[A2A_ERROR] google-adk runtime error: {first_line}"
 
 
+def extract_incoming_text(context, fallback) -> str:
+    """Resolve the user's text for this turn.
+
+    Prefers the a2a SDK's own ``RequestContext.get_user_input()`` — it tracks
+    the message-part shape across SDK versions. The platform helper
+    ``extract_message_text(context)`` silently returned ``""`` on a2a-sdk 1.1.0
+    (parts not found), so every turn errored with "no text content"
+    (e2e-found 2026-05-29). ``fallback`` (the platform helper, attachment-aware)
+    runs only when get_user_input is unavailable/empty so file-only messages
+    still resolve. Pure: ``context`` is duck-typed, ``fallback`` injected.
+    """
+    try:
+        text = (context.get_user_input() or "").strip()
+    except Exception:  # noqa: BLE001 — older/edge SDKs lack it; fall back
+        text = ""
+    return text or fallback(context)
+
+
 # ---------------------------------------------------------------------------
 # Executor
 # ---------------------------------------------------------------------------
@@ -134,7 +152,9 @@ class GoogleADKA2AExecutor(AgentExecutor):
             set_current_task,
         )
 
-        user_input = extract_message_text(context)
+        # get_user_input() first (SDK-version-stable), platform helper as the
+        # attachment-aware fallback — see extract_incoming_text doc.
+        user_input = extract_incoming_text(context, extract_message_text)
         if not user_input:
             await event_queue.enqueue_event(
                 new_text_message("Error: message contained no text content.")
