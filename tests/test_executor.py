@@ -10,13 +10,10 @@ from google_adk_executor import (
 
 
 class _Ctx:
-    """Duck-typed RequestContext: get_user_input may return text, raise, or be absent."""
-    def __init__(self, value=None, raises=False, absent=False):
+    """Duck-typed RequestContext whose get_user_input may return text or raise."""
+    def __init__(self, value=None, raises=False):
         self._value = value
         self._raises = raises
-        if absent:
-            # simulate an SDK whose RequestContext lacks get_user_input
-            del self.get_user_input
 
     def get_user_input(self):
         if self._raises:
@@ -24,19 +21,28 @@ class _Ctx:
         return self._value
 
 
-def test_incoming_text_prefers_get_user_input():
-    # fallback must NOT run when get_user_input yields text (the a2a-sdk 1.1.0 fix)
-    def _fallback(_):
-        raise AssertionError("fallback should not be called")
-    assert extract_incoming_text(_Ctx(value="  hello  "), _fallback) == "hello"
+def _boom(_ctx):
+    raise AssertionError("get_user_input fallback must not run when primary has text")
 
 
-def test_incoming_text_falls_back_when_get_user_input_empty():
-    assert extract_incoming_text(_Ctx(value=""), lambda _c: "from-parts") == "from-parts"
-
-
-def test_incoming_text_falls_back_when_get_user_input_raises():
+def test_incoming_text_prefers_primary_extractor():
+    # primary (extract_message_text) runs first; get_user_input is NOT consulted
     assert extract_incoming_text(_Ctx(raises=True), lambda _c: "from-parts") == "from-parts"
+
+
+def test_incoming_text_preserves_attachment_manifest():
+    # the attachment manifest only the primary emits must survive (regression guard)
+    manifest = "What is this?\n\nAttached files:\n- doc.pdf (application/pdf) at /work/doc.pdf"
+    assert extract_incoming_text(_Ctx(value="What is this?"), lambda _c: manifest) == manifest
+
+
+def test_incoming_text_falls_back_to_get_user_input_when_primary_empty():
+    # the a2a-sdk-1.1.0 safety net: primary returned "" -> recover text via the SDK
+    assert extract_incoming_text(_Ctx(value="  sdk text  "), lambda _c: "") == "sdk text"
+
+
+def test_incoming_text_fallback_survives_get_user_input_raising():
+    assert extract_incoming_text(_Ctx(raises=True), lambda _c: "") == ""
 
 
 def test_incoming_text_empty_when_both_empty():

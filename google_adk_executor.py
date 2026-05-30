@@ -92,22 +92,31 @@ def sanitize_error(exc: Exception) -> str:
     return f"[A2A_ERROR] google-adk runtime error: {first_line}"
 
 
-def extract_incoming_text(context, fallback) -> str:
-    """Resolve the user's text for this turn.
+def extract_incoming_text(context, primary) -> str:
+    """Resolve the user's text (and any attachment manifest) for this turn.
 
-    Prefers the a2a SDK's own ``RequestContext.get_user_input()`` — it tracks
-    the message-part shape across SDK versions. The platform helper
-    ``extract_message_text(context)`` silently returned ``""`` on a2a-sdk 1.1.0
-    (parts not found), so every turn errored with "no text content"
-    (e2e-found 2026-05-29). ``fallback`` (the platform helper, attachment-aware)
-    runs only when get_user_input is unavailable/empty so file-only messages
-    still resolve. Pure: ``context`` is duck-typed, ``fallback`` injected.
+    ``primary`` is the platform's ``extract_message_text`` — it is
+    attachment-aware (emits the ``Attached files:`` manifest with local paths,
+    the only channel that tells the agent a file exists) and resolves correctly
+    on the pinned a2a-sdk 1.0.3. It runs FIRST so a text+attachment message
+    never loses its files.
+
+    Only when ``primary`` yields nothing do we fall back to the a2a SDK's own
+    ``context.get_user_input()`` — a version-stable safety net for the failure
+    mode that triggered this fix: on a2a-sdk 1.1.0 ``extract_message_text``
+    silently returned ``""`` (part shape changed) and every turn errored with
+    "no text content" (e2e-found 2026-05-29). The fallback recovers the text
+    (attachments would be unavailable in that degraded path, but a future SDK
+    bump no longer hard-breaks the turn). Pure: ``context`` duck-typed,
+    ``primary`` injected.
     """
+    text = primary(context)
+    if text:
+        return text
     try:
-        text = (context.get_user_input() or "").strip()
-    except Exception:  # noqa: BLE001 — older/edge SDKs lack it; fall back
-        text = ""
-    return text or fallback(context)
+        return (context.get_user_input() or "").strip()
+    except Exception:  # noqa: BLE001 — older/edge SDKs lack it
+        return ""
 
 
 # ---------------------------------------------------------------------------
