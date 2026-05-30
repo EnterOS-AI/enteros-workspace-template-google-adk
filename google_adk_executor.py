@@ -152,7 +152,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         from a2a.helpers import new_text_message
         from a2a.server.tasks import TaskUpdater
-        from a2a.types import Part
+        from a2a.types import Part, Task, TaskStatus
         from google.genai import types
 
         from molecule_runtime.adapters.shared_runtime import (
@@ -160,9 +160,10 @@ class GoogleADKA2AExecutor(AgentExecutor):
             extract_message_text,
             set_current_task,
         )
+        from molecule_runtime.executor_helpers import task_state_value
 
-        # get_user_input() first (SDK-version-stable), platform helper as the
-        # attachment-aware fallback — see extract_incoming_text doc.
+        # extract_message_text (attachment-aware) first, context.get_user_input()
+        # as the SDK-version-stable empty-result fallback — see extract_incoming_text doc.
         user_input = extract_incoming_text(context, extract_message_text)
         if not user_input:
             await event_queue.enqueue_event(
@@ -172,6 +173,29 @@ class GoogleADKA2AExecutor(AgentExecutor):
 
         task_id = context.task_id or str(uuid.uuid4())
         context_id = context.context_id or str(uuid.uuid4())
+
+        # A2A v1 contract (a2a-sdk >= 1.0): a Task must be enqueued before any
+        # TaskStatusUpdateEvent. The SDK auto-creates the Task only for
+        # continuation messages (existing task resolves via the task manager);
+        # for a FRESH request context.current_task is None and the first
+        # updater.start_work() is rejected with InvalidAgentResponseError
+        # "Agent should enqueue Task before TaskStatusUpdateEvent event". Mirror
+        # the platform reference executor: enqueue a SUBMITTED Task first.
+        # (e2e-found 2026-05-30 — only reachable once the incoming-text fix let
+        # execution proceed past extraction.)
+        if getattr(context, "current_task", None) is None:
+            # task_state_value resolves TASK_STATE_SUBMITTED across the SDK's
+            # protobuf TaskState (TaskState.Value(name)) and test-stub shapes —
+            # the platform's TaskState is a protobuf enum, NOT a Python enum, so
+            # TaskState.submitted does not exist. Mirrors the reference executor.
+            await event_queue.enqueue_event(
+                Task(
+                    id=task_id,
+                    context_id=context_id,
+                    status=TaskStatus(state=task_state_value("TASK_STATE_SUBMITTED")),
+                )
+            )
+
         updater = TaskUpdater(event_queue, task_id, context_id)
 
         # Heartbeat task accounting — load-bearing (online/busy/offline + scheduler).
