@@ -70,8 +70,8 @@ class GoogleADKAdapter(BaseAdapter):
         return {
             "model": {
                 "type": "string",
-                "description": "google_genai:gemini-2.5-pro (AI Studio) or vertex:gemini-2.5-pro",
-                "default": "google_genai:gemini-2.5-pro",
+                "description": "platform:gemini-2.5-pro (platform-managed, keyless+metered) | google_genai:gemini-2.5-pro (AI Studio BYOK) | vertex:gemini-2.5-pro (Vertex BYOK)",
+                "default": "platform:gemini-2.5-pro",
             },
         }
 
@@ -131,7 +131,19 @@ class GoogleADKAdapter(BaseAdapter):
         # MCPToolset instead (RFC internal#730).
         setup_result = await self._common_setup(config)
 
-        if self._resolved.needs_litellm:
+        if self._resolved.is_platform:
+            # Platform-managed: LiteLlm over Molecule's OpenAI-compatible LLM
+            # proxy. api_base/api_key are the platform-injected proxy env
+            # (OPENAI_BASE_URL = CP proxy, OPENAI_API_KEY = org usage token),
+            # passed explicitly so litellm never depends on env-var name
+            # matching. The proxy mints Vertex server-side and meters usage.
+            from google.adk.models.lite_llm import LiteLlm
+            model = LiteLlm(
+                model=self._resolved.model,
+                api_base=os.environ["OPENAI_BASE_URL"],
+                api_key=os.environ["OPENAI_API_KEY"],
+            )
+        elif self._resolved.needs_litellm:
             from google.adk.models.lite_llm import LiteLlm
             model = LiteLlm(model=self._resolved.model)
         else:
