@@ -26,7 +26,7 @@ _GOOGLE_PREFIXES = frozenset(
     {"google", "google_genai", "googlegenai", "gemini", "vertex", "vertexai"}
 )
 _VERTEX_PREFIXES = frozenset({"vertex", "vertexai"})
-_PLATFORM_PREFIXES = frozenset({"platform", "molecule"})
+_PLATFORM_PREFIXES = frozenset({"platform", "molecule", "vertex", "vertexai"})
 _DEFAULT_VERTEX_LOCATION = "us-central1"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -78,51 +78,47 @@ def resolve_model(model_str: str, env: Mapping[str, str]) -> ResolvedModel:
             "'google_genai:gemini-2.5-pro'."
         )
 
-    # Platform-managed (metered, keyless): route Gemini through Molecule's
-    # OpenAI-compatible LLM proxy. The platform injects OPENAI_BASE_URL (the
-    # CP proxy) + OPENAI_API_KEY (the org usage token) into every workspace
-    # via /tenants/config; the proxy mints the real Vertex credential
-    # server-side — no Google credential ever reaches this box — and meters
-    # usage to org credits. No BYOK key required. LiteLlm's "openai/<id>"
-    # form sends the bare id ("gemini-2.5-pro") to the proxy, which resolves
-    # it to Vertex (cp llm_proxy.go google/vertex case).
-    if prefix in _PLATFORM_PREFIXES:
+    is_gemini = prefix in _GOOGLE_PREFIXES or (
+        prefix == "" and bare.lower().startswith("gemini")
+    )
+
+    # Platform-managed (metered, keyless) routing via Molecule's OpenAI-
+    # compatible LLM proxy. Triggered by an explicit platform:/molecule:/
+    # vertex: prefix, or by the GOOGLE_GENAI_USE_VERTEXAI opt-in on a Gemini
+    # model. EVERY "serve via Vertex" path now goes through the proxy — which
+    # mints the Vertex credential server-side (no Google credential ever
+    # reaches this tenant box; this is the keyless-Vertex leak fix) and meters
+    # usage to org credits — instead of the old on-box ADC. The platform
+    # injects OPENAI_BASE_URL (CP proxy) + OPENAI_API_KEY (org usage token)
+    # into every workspace via /tenants/config. LiteLlm's "openai/<id>" form
+    # sends the bare id to the proxy, which resolves it to Vertex (cp
+    # llm_proxy.go google/vertex case).
+    use_platform = prefix in _PLATFORM_PREFIXES or (
+        is_gemini and _is_truthy(env.get("GOOGLE_GENAI_USE_VERTEXAI"))
+    )
+    if use_platform:
         if not env.get("OPENAI_BASE_URL") or not env.get("OPENAI_API_KEY"):
             raise RuntimeError(
-                "Platform-managed Gemini selected (platform: prefix) but the "
-                "Molecule LLM proxy env is absent (OPENAI_BASE_URL / "
-                "OPENAI_API_KEY). This workspace is not platform-managed — use "
-                "a BYOK model (e.g. 'google_genai:gemini-2.5-pro' + "
-                "GOOGLE_API_KEY) or enable platform-managed billing."
+                "Platform-managed Gemini selected (platform:/vertex: prefix or "
+                "GOOGLE_GENAI_USE_VERTEXAI) but the Molecule LLM proxy env is "
+                "absent (OPENAI_BASE_URL / OPENAI_API_KEY). This workspace is "
+                "not platform-managed — use AI Studio BYOK "
+                "('google_genai:gemini-2.5-pro' + GOOGLE_API_KEY) or enable "
+                "platform-managed billing."
             )
         return ResolvedModel(
             model="openai/" + bare, backend="platform", is_gemini=True
         )
 
-    is_gemini = prefix in _GOOGLE_PREFIXES or (
-        prefix == "" and bare.lower().startswith("gemini")
-    )
-
     if is_gemini:
-        use_vertex = prefix in _VERTEX_PREFIXES or _is_truthy(
-            env.get("GOOGLE_GENAI_USE_VERTEXAI")
-        )
-        if use_vertex:
-            if not env.get("GOOGLE_CLOUD_PROJECT"):
-                raise RuntimeError(
-                    "Vertex AI selected (GOOGLE_GENAI_USE_VERTEXAI / vertex: prefix) "
-                    "but GOOGLE_CLOUD_PROJECT is not set. Add it to workspace secrets "
-                    "(and optionally GOOGLE_CLOUD_LOCATION; defaults to "
-                    f"'{_DEFAULT_VERTEX_LOCATION}')."
-                )
-            return ResolvedModel(model=bare, backend="vertex", is_gemini=True)
-
+        # AI Studio BYOK — the tenant's OWN key, the tenant's OWN billing. The
+        # only direct-to-vendor Gemini path (Vertex goes through the proxy).
         if not env.get("GOOGLE_API_KEY"):
             raise RuntimeError(
-                "No GOOGLE_API_KEY found for the google-adk runtime. Get one at "
+                "No GOOGLE_API_KEY for AI Studio BYOK. Get one at "
                 "https://aistudio.google.com/apikey and store it as a workspace "
-                "secret (or switch to Vertex with GOOGLE_GENAI_USE_VERTEXAI=1 + "
-                "GOOGLE_CLOUD_PROJECT)."
+                "secret — or use 'platform:gemini-2.5-pro' for platform-managed, "
+                "keyless, metered serving (no key needed)."
             )
         return ResolvedModel(model=bare, backend="ai_studio", is_gemini=True)
 
