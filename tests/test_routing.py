@@ -4,7 +4,9 @@ import pytest
 from _routing import resolve_model, vertex_location
 
 AISTUDIO = {"GOOGLE_API_KEY": "AIza-test"}
-VERTEX = {"GOOGLE_GENAI_USE_VERTEXAI": "1", "GOOGLE_CLOUD_PROJECT": "proj-123"}
+# Leak fix (task #64): Vertex serves via the metered Molecule proxy now — the
+# platform injects OPENAI_BASE_URL (CP proxy) + OPENAI_API_KEY (org usage token).
+PROXY = {"OPENAI_BASE_URL": "https://cp/api/v1/internal/llm/openai/v1", "OPENAI_API_KEY": "org-tok"}
 
 
 @pytest.mark.parametrize("model_str", [
@@ -27,18 +29,22 @@ def test_ai_studio_requires_api_key():
         resolve_model("google_genai:gemini-2.5-pro", {})
 
 
-def test_vertex_via_env_flag():
-    r = resolve_model("google_genai:gemini-2.5-pro", VERTEX)
-    assert r.backend == "vertex" and r.model == "gemini-2.5-pro" and r.is_gemini
+def test_use_vertexai_optin_routes_via_proxy():
+    # Leak fix: GOOGLE_GENAI_USE_VERTEXAI no longer selects on-box ADC; it routes
+    # Gemini through the metered Molecule proxy (platform backend).
+    r = resolve_model("google_genai:gemini-2.5-pro", {**PROXY, "GOOGLE_GENAI_USE_VERTEXAI": "1"})
+    assert r.backend == "platform" and r.model == "openai/gemini-2.5-pro" and r.is_gemini
 
 
-def test_vertex_via_prefix_without_env_flag():
-    r = resolve_model("vertex:gemini-2.0-flash", {"GOOGLE_CLOUD_PROJECT": "p"})
-    assert r.backend == "vertex" and r.model == "gemini-2.0-flash"
+def test_vertex_prefix_routes_via_proxy():
+    # Leak fix: vertex: prefix routes through the metered proxy (no on-box ADC).
+    r = resolve_model("vertex:gemini-2.0-flash", PROXY)
+    assert r.backend == "platform" and r.model == "openai/gemini-2.0-flash"
 
 
-def test_vertex_requires_project():
-    with pytest.raises(RuntimeError, match="GOOGLE_CLOUD_PROJECT"):
+def test_vertex_without_proxy_env_is_actionable_error():
+    # Leak fix: vertex: needs the platform proxy env, not GOOGLE_CLOUD_PROJECT.
+    with pytest.raises(RuntimeError, match="OPENAI_BASE_URL"):
         resolve_model("vertex:gemini-2.5-pro", {})
 
 
