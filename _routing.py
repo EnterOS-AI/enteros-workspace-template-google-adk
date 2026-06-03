@@ -26,6 +26,7 @@ _GOOGLE_PREFIXES = frozenset(
     {"google", "google_genai", "googlegenai", "gemini", "vertex", "vertexai"}
 )
 _VERTEX_PREFIXES = frozenset({"vertex", "vertexai"})
+_PLATFORM_PREFIXES = frozenset({"platform", "molecule"})
 _DEFAULT_VERTEX_LOCATION = "us-central1"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
@@ -35,12 +36,16 @@ class ResolvedModel:
     """Outcome of resolving a workspace ``provider:model`` string for ADK."""
 
     model: str       # what to hand LlmAgent(model=...): bare gemini id, or "provider/model" for LiteLlm
-    backend: str     # "ai_studio" | "vertex" | "litellm"
+    backend: str     # "ai_studio" | "vertex" | "litellm" | "platform"
     is_gemini: bool
 
     @property
     def needs_litellm(self) -> bool:
         return self.backend == "litellm"
+
+    @property
+    def is_platform(self) -> bool:
+        return self.backend == "platform"
 
 
 def _split_prefix(model_str: str) -> tuple[str, str]:
@@ -71,6 +76,27 @@ def resolve_model(model_str: str, env: Mapping[str, str]) -> ResolvedModel:
         raise RuntimeError(
             "Empty model string. Set workspace `model` to e.g. "
             "'google_genai:gemini-2.5-pro'."
+        )
+
+    # Platform-managed (metered, keyless): route Gemini through Molecule's
+    # OpenAI-compatible LLM proxy. The platform injects OPENAI_BASE_URL (the
+    # CP proxy) + OPENAI_API_KEY (the org usage token) into every workspace
+    # via /tenants/config; the proxy mints the real Vertex credential
+    # server-side — no Google credential ever reaches this box — and meters
+    # usage to org credits. No BYOK key required. LiteLlm's "openai/<id>"
+    # form sends the bare id ("gemini-2.5-pro") to the proxy, which resolves
+    # it to Vertex (cp llm_proxy.go google/vertex case).
+    if prefix in _PLATFORM_PREFIXES:
+        if not env.get("OPENAI_BASE_URL") or not env.get("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "Platform-managed Gemini selected (platform: prefix) but the "
+                "Molecule LLM proxy env is absent (OPENAI_BASE_URL / "
+                "OPENAI_API_KEY). This workspace is not platform-managed — use "
+                "a BYOK model (e.g. 'google_genai:gemini-2.5-pro' + "
+                "GOOGLE_API_KEY) or enable platform-managed billing."
+            )
+        return ResolvedModel(
+            model="openai/" + bare, backend="platform", is_gemini=True
         )
 
     is_gemini = prefix in _GOOGLE_PREFIXES or (
