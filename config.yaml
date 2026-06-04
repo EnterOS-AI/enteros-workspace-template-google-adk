@@ -13,28 +13,28 @@ runtime: google-adk
 
 runtime_config:
   # Platform-managed by default: keyless, metered Gemini via Molecule's LLM
-  # proxy (no GOOGLE_API_KEY needed). BYOK options remain in models[] below.
-  model: platform:gemini-2.5-pro
+  # proxy (no GOOGLE_API_KEY needed). Uses the registry-registered id
+  # `vertex:gemini-2.5-pro` (provider-registry SSOT, internal#718) which the
+  # runtime routes through the metered proxy. BYOK options in models[] below.
+  model: vertex:gemini-2.5-pro
   required_env: []
 
 # Top-level models[] — the authoritative servability source for this runtime
 # (langgraph-style; the registry projection is a subset of this).
 models:
-  - id: platform:gemini-2.5-pro
+  # Every id MUST be registered for google-adk in the provider-registry SSOT
+  # (CP providers.yaml runtimes.google-adk) or workspace create returns 422
+  # UNREGISTERED_MODEL_FOR_RUNTIME. Registered ids: vertex:gemini-2.5-pro
+  # (exact) + gemini-2.5-pro (google ^gemini- prefix; google_genai: alias).
+  - id: vertex:gemini-2.5-pro
     name: Gemini 2.5 Pro (Platform — metered, no key)
     required_env: []
-  - id: platform:gemini-2.5-flash
-    name: Gemini 2.5 Flash (Platform — metered, no key)
-    required_env: []
   - id: google_genai:gemini-2.5-pro
-    name: Gemini 2.5 Pro (Google AI Studio)
+    name: Gemini 2.5 Pro (Google AI Studio — BYOK)
     required_env: [GOOGLE_API_KEY]
   - id: google_genai:gemini-2.5-flash
-    name: Gemini 2.5 Flash (Google AI Studio)
+    name: Gemini 2.5 Flash (Google AI Studio — BYOK)
     required_env: [GOOGLE_API_KEY]
-  - id: vertex:gemini-2.5-pro
-    name: Gemini 2.5 Pro (Vertex — platform, metered, no key)
-    required_env: []
 
 prompt_files:
   - system-prompt.md
