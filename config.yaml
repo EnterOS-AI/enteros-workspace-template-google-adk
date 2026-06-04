@@ -17,7 +17,7 @@ runtime_config:
   # closed `platform` provider in the registry SSOT (cp#511/core#2182) ->
   # platform_managed billing + required_env=[] (DERIVED, not hand-authored).
   # BYOK options in models[] below.
-  model: vertex:gemini-2.5-pro
+  model: platform:gemini-2.5-pro
   required_env: []
 
 # Top-level models[] — the authoritative servability source for this runtime
@@ -27,8 +27,11 @@ models:
   # (CP providers.yaml runtimes.google-adk) or workspace create returns 422
   # UNREGISTERED_MODEL_FOR_RUNTIME. Registered ids: vertex:gemini-2.5-pro
   # (exact) + gemini-2.5-pro (google ^gemini- prefix; google_genai: alias).
-  - id: vertex:gemini-2.5-pro
+  - id: platform:gemini-2.5-pro
     name: Gemini 2.5 Pro (Platform — metered, no key)
+    required_env: []
+  - id: platform:gemini-2.5-flash
+    name: Gemini 2.5 Flash (Platform — metered, no key)
     required_env: []
   - id: google_genai:gemini-2.5-pro
     name: Gemini 2.5 Pro (Google AI Studio — BYOK)
