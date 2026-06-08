@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — shared infrastructure (Gitea PyPI registry)
-molecule-ai-workspace-runtime>=0.2.0
+molecule-ai-workspace-runtime>=0.3.10
 
 # Pin a2a-sdk to 1.0.3 — the version the rest of the fleet actually runs
 # (verified live: claude-code workspaces are on 1.0.3 and extract incoming
