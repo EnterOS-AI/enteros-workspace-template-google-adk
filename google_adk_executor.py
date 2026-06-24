@@ -92,6 +92,42 @@ def sanitize_error(exc: Exception) -> str:
     return f"[A2A_ERROR] google-adk runtime error: {first_line}"
 
 
+def extract_loaded_mcp_tools(events) -> list[str]:
+    """Return the loaded MCP tool ids the ADK run actually invoked.
+
+    ADK events carry function-call parts (a ``function_call.name`` per part)
+    for every tool the agent called. After the first turn runs, this is
+    the ground-truth "what the agent actually had available" — distinct
+    from the configured list (which the runtime may have requested but the
+    toolset didn't actually load). Normalising: ADK prefixes MCP tools
+    with the server id (``mcp__<server>__<action>``); pass through unchanged.
+    Duck-typed on parts because ADK's part shape drifts between SDK
+    minor versions and we don't import google.adk here.
+    """
+    seen: set[str] = set()
+    order: list[str] = []
+    for event in events:
+        content = getattr(event, "content", None)
+        parts = getattr(content, "parts", None) or []
+        for part in parts:
+            # The mcp__* function-call shape: ``part.function_call.name`` is
+            # the canonical ADK FieldPath. Older SDKs nest under
+            # ``part.function_call['name']`` (dict-like) — handle both.
+            fc = getattr(part, "function_call", None)
+            if fc is None:
+                continue
+            name = getattr(fc, "name", None) or (
+                fc.get("name") if isinstance(fc, dict) else None
+            )
+            if not isinstance(name, str) or not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            order.append(name)
+    return order
+
+
 def extract_incoming_text(context, primary) -> str:
     """Resolve the user's text (and any attachment manifest) for this turn.
 
@@ -209,6 +245,14 @@ class GoogleADKA2AExecutor(AgentExecutor):
                 user_id=self._user_id, session_id=context_id, new_message=new_message
             )
             final_text = await self._drain(events, updater, Part)
+            # core#3082: report the actually-loaded MCP tool ids from this
+            # turn to the platform. ADK's event stream carries function-call
+            # parts naming each invoked tool — ground truth (the configured
+            # toolset can request a tool that the server never actually
+            # loaded). Report once per turn, after the first response, so
+            # the gate sees live evidence rather than configured intent.
+            from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+            set_loaded_mcp_tools(extract_loaded_mcp_tools(events))
             # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
             # executor is in TASK MODE, where a raw Message enqueue is rejected
             # ("Received Message object in task mode. Use TaskStatusUpdateEvent
