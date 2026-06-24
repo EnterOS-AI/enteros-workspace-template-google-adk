@@ -193,6 +193,22 @@ jobs:
           fi
           docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
 
+          # LiteLlm import smoke (regression guard for the platform-managed
+          # default model). google-adk 2.1.0 gates LiteLlm behind the
+          # [extensions] extra; the platform: Gemini path (config.yaml default)
+          # does `from google.adk.models.lite_llm import LiteLlm` in
+          # adapter.create_executor(). A [mcp]-only install builds clean (the
+          # import is lazy) but boots un-servable on the default model — the
+          # "google-adk fails to start / no URL" symptom. This proves the
+          # extra actually RESOLVED at install time, inside the built image.
+          # tests/test_litellm_import.py covers the static Dockerfile shape;
+          # this covers the real upstream packaging.
+          echo "::group::LiteLlm import smoke (platform-managed default model dep)"
+          docker run --rm --entrypoint python3 template-test -c \
+            'import google.adk.models.lite_llm as m; print("LiteLlm OK:", m.LiteLlm.__name__)'
+          echo "::endgroup::"
+          echo "LiteLlm import smoke passed — platform Gemini path is servable"
+
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the EXACT
   # flags the controlplane provisioner emits for tier-4

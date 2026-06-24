@@ -48,11 +48,26 @@ RUN pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r req
       pip install --no-cache-dir --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
-# Google ADK from PyPI. [mcp] pulls the MCP client for McpToolset; we NEVER
-# install the [a2a] extra (it pins a2a-sdk<0.4, incompatible with the
+# Google ADK from PyPI.
+#   [mcp]        -> the MCP client for McpToolset (platform tools over stdio).
+#   [extensions] -> google.adk.models.lite_llm.LiteLlm (pulls `litellm`).
+# LiteLlm is REQUIRED, not optional: the platform-managed default model
+# (`platform:gemini-2.5-*`, config.yaml) routes Gemini through Molecule's
+# OpenAI-compatible LLM proxy, and adapter.create_executor() does
+# `from google.adk.models.lite_llm import LiteLlm` for that path. In
+# google-adk 2.1.0 LiteLlm is gated behind the [extensions] extra; with only
+# [mcp], that import raises `ImportError: LiteLLM support requires:
+# pip install google-adk[extensions]` and the agent boots un-servable
+# (create_executor fails -> workspace never serves the default model). The
+# import is lazy, so a [mcp]-only image builds clean and passes the
+# import-only smoke — it only breaks at boot on the platform path, which no CI
+# arm exercised (the e2e google-adk live arm tests AI-Studio BYOK, which does
+# not need LiteLlm). See tests/test_litellm_import.py + the Dockerfile
+# litellm-import smoke in ci.yml for the regression guard.
+# We NEVER install the [a2a] extra (it pins a2a-sdk<0.4, incompatible with the
 # platform's a2a-sdk>=1.0).
 # FOLLOW-UP (RFC #730 Phase 0): switch to the molecule-ai/adk-python fork.
-RUN pip install --no-cache-dir "google-adk[mcp]==2.1.0"
+RUN pip install --no-cache-dir "google-adk[mcp,extensions]==2.1.0"
 
 # Adapter code (top-level modules; /app is on sys.path, ADAPTER_MODULE=adapter)
 COPY adapter.py google_adk_executor.py _routing.py __init__.py config.yaml ./
