@@ -70,8 +70,8 @@ class GoogleADKAdapter(BaseAdapter):
         return {
             "model": {
                 "type": "string",
-                "description": "platform:gemini-2.5-pro (platform-managed, keyless+metered) | google_genai:gemini-2.5-pro (AI Studio BYOK) | vertex:gemini-2.5-pro (Vertex BYOK)",
-                "default": "platform:gemini-2.5-pro",
+                "description": "platform:gemini (platform-managed, keyless+metered) | google_genai:gemini-2.5-pro (AI Studio BYOK) | vertex:gemini-2.5-pro (Vertex BYOK)",
+                "default": "platform:gemini",
             },
         }
 
