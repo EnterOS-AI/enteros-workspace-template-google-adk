@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Iterable
+from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -244,7 +245,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
             events = self._runner.run_async(
                 user_id=self._user_id, session_id=context_id, new_message=new_message
             )
-            final_text = await self._drain(events, updater, Part)
+            final_text, loaded_tools = await self._drain(events, updater, Part)
             # core#3082: report the actually-loaded MCP tool ids from this
             # turn to the platform. ADK's event stream carries function-call
             # parts naming each invoked tool — ground truth (the configured
@@ -252,7 +253,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
             # loaded). Report once per turn, after the first response, so
             # the gate sees live evidence rather than configured intent.
             from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
-            set_loaded_mcp_tools(extract_loaded_mcp_tools(events))
+            set_loaded_mcp_tools(loaded_tools)
             # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
             # executor is in TASK MODE, where a raw Message enqueue is rejected
             # ("Received Message object in task mode. Use TaskStatusUpdateEvent
@@ -278,13 +279,15 @@ class GoogleADKA2AExecutor(AgentExecutor):
             # Clear the in-flight task so heartbeat active_tasks decrements.
             await set_current_task(self._heartbeat, None)
 
-    async def _drain(self, events, updater, Part) -> str:
-        """Async-drain ADK's event stream, emit artifacts, return final text."""
+    async def _drain(self, events, updater, Part) -> tuple[str, list[str]]:
+        """Async-drain ADK's event stream, emit artifacts, return final text + loaded MCP tools."""
         final_text = ""
         streamed: list[str] = []
         artifact_id = str(uuid.uuid4())
         has_streamed = False
+        collected_events: list[Any] = []
         async for event in events:
+            collected_events.append(event)
             texts = extract_event_text(event)
             if is_final(event):
                 final_text = "".join(texts)
@@ -295,7 +298,8 @@ class GoogleADKA2AExecutor(AgentExecutor):
                         parts=[Part(text=t)], artifact_id=artifact_id, append=has_streamed
                     )
                     has_streamed = True
-        return final_text or "".join(streamed)
+        loaded_tools = extract_loaded_mcp_tools(collected_events)
+        return final_text or "".join(streamed), loaded_tools
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # ADK's in-memory Runner has no mid-run cancellation hook; the A2A

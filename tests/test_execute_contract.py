@@ -93,6 +93,14 @@ def _install_execute_stubs():
     eh.task_state_value = lambda name: name
     sys.modules["molecule_runtime.executor_helpers"] = eh
 
+    # core#3082: google-adk execute() reports actually-loaded MCP tool ids via
+    # molecule_runtime.platform_agent_identity.set_loaded_mcp_tools. The CI
+    # runner does not install the real runtime package, so provide a no-op stub
+    # that keeps the production hook intact without crashing the contract tests.
+    pai = _t.ModuleType("molecule_runtime.platform_agent_identity")
+    pai.set_loaded_mcp_tools = lambda tools: None
+    sys.modules["molecule_runtime.platform_agent_identity"] = pai
+
 
 _install_execute_stubs()
 
