@@ -24,3 +24,9 @@ python-multipart>=0.0.27
 # extra (it pins a2a-sdk<0.4, incompatible with the platform's a2a-sdk>=1.0).
 # FOLLOW-UP (RFC internal#730 Phase 0): switch to the molecule-ai/adk-python
 # fork (don't rely on upstream) once it's published to the Gitea PyPI registry.
+
+# Test-only: required by the four @pytest.mark.asyncio contract tests in
+# tests/test_execute_contract.py. Without this plugin the tests fail with
+# "async def functions are not natively supported" — pre-existing in
+# main, fixed here as a pre-flight for the #3082 fix CI run.
+pytest-asyncio>=0.23

@@ -93,10 +93,25 @@ def _install_execute_stubs():
     eh.task_state_value = lambda name: name
     sys.modules["molecule_runtime.executor_helpers"] = eh
 
+    # core#3082: google-adk execute() reports actually-loaded MCP tool ids via
+    # molecule_runtime.platform_agent_identity.set_loaded_mcp_tools. The CI
+    # runner does not install the real runtime package, so provide a recording
+    # stub that lets contract tests assert the hook is called with the inventory.
+    pai = _t.ModuleType("molecule_runtime.platform_agent_identity")
+    pai._loaded_calls: list[list[str]] = []
+    pai.set_loaded_mcp_tools = lambda tools: pai._loaded_calls.append(list(tools or []))
+    sys.modules["molecule_runtime.platform_agent_identity"] = pai
+
 
 _install_execute_stubs()
 
 from google_adk_executor import GoogleADKA2AExecutor  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_loaded_calls():
+    sys.modules["molecule_runtime.platform_agent_identity"]._loaded_calls.clear()
+    yield
 
 
 # ---- fakes for the runner / session / event queue / context -------------
@@ -140,6 +155,30 @@ class _Runner:
         return _gen()
 
 
+class _Tool:
+    def __init__(self, name):
+        self.name = name
+
+
+class _McpToolset:
+    """Fake McpToolset exposing the platform tool inventory."""
+    def __init__(self, *names):
+        self._names = names
+
+    def get_tools(self):
+        return [_Tool(n) for n in self._names]
+
+
+_DEFAULT_TOOLS = [
+    _McpToolset(
+        "list_peers",
+        "commit_memory",
+        "send_message_to_user",
+        "create_workspace",
+    ),
+]
+
+
 class _Queue:
     def __init__(self):
         self.enqueued = []
@@ -160,8 +199,10 @@ class _Ctx:
         return self._text
 
 
-async def _run(events, *, text="hello", current_task=None):
-    ex = GoogleADKA2AExecutor(_Runner(events), app_name="molecule", user_id="u1")
+async def _run(events, *, text="hello", current_task=None, tools=None):
+    ex = GoogleADKA2AExecutor(
+        _Runner(events), app_name="molecule", user_id="u1", tools=tools if tools is not None else _DEFAULT_TOOLS
+    )
     q = _Queue()
     await ex.execute(_Ctx(text, current_task=current_task), q)
     return q, q._updater
@@ -177,6 +218,10 @@ async def test_success_completes_via_updater_not_raw_enqueue():
     assert msg.text == "Hello from Gemini on ADK."
     # the only thing enqueued raw is the SUBMITTED Task (bug #3), never the reply text
     assert len(q.enqueued) == 1, f"only the Task may be raw-enqueued; got {q.enqueued}"
+    # core#3082: the loaded MCP inventory is reported independent of this turn's calls
+    pai = sys.modules["molecule_runtime.platform_agent_identity"]
+    assert len(pai._loaded_calls) == 1
+    assert "mcp__molecule-platform__create_workspace" in pai._loaded_calls[0]
 
 
 @pytest.mark.asyncio
@@ -205,3 +250,14 @@ async def test_error_path_uses_updater_failed():
     await ex.execute(_Ctx("hi"), q)
     kinds = [c[0] for c in q._updater.calls]
     assert "failed" in kinds, f"error path must call updater.failed(); calls={kinds}"
+
+
+@pytest.mark.asyncio
+async def test_3082_no_loaded_toolset_reports_empty_inventory():
+    # present-only (no McpToolset loaded) must report empty inventory so the
+    # platform gate degrades rather than trusting a guessed static list.
+    q, updater = await _run([_Event("ok", final=True)], tools=[])
+    assert "complete" in [c[0] for c in updater.calls]
+    pai = sys.modules["molecule_runtime.platform_agent_identity"]
+    assert len(pai._loaded_calls) == 1
+    assert pai._loaded_calls[0] == []

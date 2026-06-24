@@ -1,9 +1,12 @@
 """Unit tests for google-adk event draining + error sanitisation (pure)."""
 
+import pytest
+
 from google_adk_executor import (
     collect_response_text,
     extract_event_text,
     extract_incoming_text,
+    extract_loaded_mcp_tools,
     is_final,
     sanitize_error,
 )
@@ -78,6 +81,113 @@ def test_extract_event_text_handles_missing_content():
         pass
     assert extract_event_text(_Bare()) == []
 
+
+# ---------------------------------------------------------------------------
+# core#3082 — extract_loaded_mcp_tools (the runtime-agnostic producer that
+# reports the MCP tool INVENTORY actually loaded by ADK's McpToolset, not the
+# subset a given turn happens to invoke). The previous per-turn function-call
+# version shipped green while leaving required tools (e.g. create_workspace)
+# unreported whenever the current turn didn't call them — so the gate stayed
+# degraded. These tests exercise the inventory-based contract.
+# ---------------------------------------------------------------------------
+
+class _Tool:
+    """Duck-typed ADK tool declaration (``.name`` is the raw MCP tool name)."""
+    def __init__(self, name):
+        self.name = name
+
+
+class _SyncToolset:
+    """Fake McpToolset whose ``get_tools()`` is synchronous."""
+    def __init__(self, *names):
+        self._names = names
+
+    def get_tools(self):
+        return [_Tool(n) for n in self._names]
+
+
+class _AsyncToolset:
+    """Fake McpToolset whose ``get_tools()`` is a coroutine (ADK shape)."""
+    def __init__(self, *names):
+        self._names = names
+
+    async def get_tools(self):
+        return [_Tool(n) for n in self._names]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_expands_sync_toolset():
+    # Raw MCP names returned by ADK's McpToolset get_tools() are normalised to
+    # the platform namespaced IDs the controlplane gate expects.
+    assert await extract_loaded_mcp_tools([
+        _SyncToolset(
+            "list_peers",
+            "commit_memory",
+            "create_workspace",
+        )
+    ]) == [
+        "mcp__molecule-platform__list_peers",
+        "mcp__molecule-platform__commit_memory",
+        "mcp__molecule-platform__create_workspace",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_expands_async_toolset():
+    assert await extract_loaded_mcp_tools([
+        _AsyncToolset("send_message_to_user")
+    ]) == ["mcp__molecule-platform__send_message_to_user"]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_ignores_non_mcp_tools():
+    class _OtherTool:
+        name = "some_builtin_tool"
+    assert await extract_loaded_mcp_tools([_OtherTool(), _SyncToolset("recall_memory")]) == [
+        "mcp__molecule-platform__recall_memory",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_dedupes_across_toolsets():
+    toolsets = [
+        _SyncToolset("list_peers"),
+        _SyncToolset("list_peers", "commit_memory"),
+    ]
+    assert await extract_loaded_mcp_tools(toolsets) == [
+        "mcp__molecule-platform__list_peers",
+        "mcp__molecule-platform__commit_memory",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_empty_when_no_toolset_loaded():
+    assert await extract_loaded_mcp_tools([]) == []
+    assert await extract_loaded_mcp_tools(None) == []
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_create_workspace_is_in_inventory():
+    """#3082 recovery: the required tool must be reported when the toolset is
+    loaded, even if the sample turn never invokes it."""
+    assert "mcp__molecule-platform__create_workspace" in await extract_loaded_mcp_tools([
+        _SyncToolset(
+            "list_peers",
+            "commit_memory",
+            "create_workspace",
+        )
+    ])
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_skip_failing_toolset():
+    """A toolset that fails to enumerate must not crash extraction."""
+    class _Boom:
+        def get_tools(self):
+            raise RuntimeError("mcp server not ready")
+    assert await extract_loaded_mcp_tools([_Boom(), _SyncToolset("list_peers")]) == [
+        "mcp__molecule-platform__list_peers",
+    ]
 
 def test_is_final_detects_terminal_event():
     assert is_final(_Event(final=True)) is True

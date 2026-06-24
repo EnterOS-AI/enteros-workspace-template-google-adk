@@ -17,14 +17,21 @@ deferred (gated no-op) — see the RFC's "out of scope" section.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from collections.abc import Iterable
+from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 
 logger = logging.getLogger(__name__)
+
+# Platform MCP server slug used to turn raw MCP tool names (e.g. ``create_workspace``)
+# into the namespaced platform IDs (``mcp__molecule-platform__create_workspace``)
+# the controlplane's online/degraded gate expects.
+_PLATFORM_MCP_SERVER = "molecule-platform"
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +99,56 @@ def sanitize_error(exc: Exception) -> str:
     return f"[A2A_ERROR] google-adk runtime error: {first_line}"
 
 
+async def extract_loaded_mcp_tools(tools) -> list[str]:
+    """Return the loaded MCP tool ids from the ADK agent's tool inventory.
+
+    ``tools`` is ``agent.tools`` — for the platform concierge this contains one
+    or more ``McpToolset`` objects. Each ``McpToolset`` exposes ``get_tools()``
+    (sync or async) returning the actually-loaded tool declarations. ADK returns
+    their raw MCP names (e.g. ``create_workspace``); we normalise them to the
+    platform IDs the controlplane gate expects, such as
+    ``mcp__molecule-platform__create_workspace``. Non-MCP tools are ignored.
+
+    Duck-typed and defensive: we never import ``google.adk`` here, and a
+    toolset that fails to enumerate is skipped rather than crashing the turn.
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for tool in tools or []:
+        sub_tools: list[Any] = []
+        get_tools = getattr(tool, "get_tools", None)
+        if callable(get_tools):
+            try:
+                maybe_tools = get_tools()
+                if inspect.iscoroutine(maybe_tools):
+                    maybe_tools = await maybe_tools
+                sub_tools = list(maybe_tools or [])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "extract_loaded_mcp_tools: toolset enumeration failed: %s",
+                    exc,
+                )
+                continue
+        else:
+            # ``agent.tools`` may contain LangChain-style builtins or already-
+            # expanded tools; only MCP toolset inventories are reported here.
+            continue
+
+        for t in sub_tools:
+            name = getattr(t, "name", None)
+            if not isinstance(name, str) or not name:
+                continue
+            # Normalise raw MCP tool names to the platform namespaced ID.
+            if not name.startswith("mcp__"):
+                name = f"mcp__{_PLATFORM_MCP_SERVER}__{name}"
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+
+    return result
+
+
 def extract_incoming_text(context, primary) -> str:
     """Resolve the user's text (and any attachment manifest) for this turn.
 
@@ -132,12 +189,13 @@ class GoogleADKA2AExecutor(AgentExecutor):
     via ``set_current_task`` brackets every turn.
     """
 
-    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None):
+    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None, tools=None):
         self._runner = runner
         self._app_name = app_name
         self._user_id = user_id
         self._model = model
         self._heartbeat = heartbeat
+        self._tools = tools or []
 
     async def _ensure_session(self, session_id: str) -> None:
         svc = self._runner.session_service
@@ -204,11 +262,18 @@ class GoogleADKA2AExecutor(AgentExecutor):
             await self._ensure_session(context_id)
             await updater.start_work()
 
+            # core#3082: enumerate the actually-loaded MCP tool inventory from the
+            # agent's toolset(s). This is the available-tool inventory, independent
+            # of whether the current turn invokes any particular tool.
+            loaded_tools = await extract_loaded_mcp_tools(self._tools)
+
             new_message = types.Content(role="user", parts=[types.Part(text=user_input)])
             events = self._runner.run_async(
                 user_id=self._user_id, session_id=context_id, new_message=new_message
             )
             final_text = await self._drain(events, updater, Part)
+            from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+            set_loaded_mcp_tools(loaded_tools)
             # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
             # executor is in TASK MODE, where a raw Message enqueue is rejected
             # ("Received Message object in task mode. Use TaskStatusUpdateEvent
