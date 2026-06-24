@@ -1,5 +1,7 @@
 """Unit tests for google-adk event draining + error sanitisation (pure)."""
 
+import pytest
+
 from google_adk_executor import (
     collect_response_text,
     extract_event_text,
@@ -82,143 +84,110 @@ def test_extract_event_text_handles_missing_content():
 
 # ---------------------------------------------------------------------------
 # core#3082 — extract_loaded_mcp_tools (the runtime-agnostic producer that
-# reports what ADK actually loaded, not what was configured). The previous
-# "happy path" test for #3082 was a pre-seeded resumeGuard analogue — it
-# shipped green while the production lazy-init path was the real bug. These
-# tests exercise the production hook end-to-end (events in, no pre-seeding).
+# reports the MCP tool INVENTORY actually loaded by ADK's McpToolset, not the
+# subset a given turn happens to invoke). The previous per-turn function-call
+# version shipped green while leaving required tools (e.g. create_workspace)
+# unreported whenever the current turn didn't call them — so the gate stayed
+# degraded. These tests exercise the inventory-based contract.
 # ---------------------------------------------------------------------------
 
-class _Fc:
-    """Attribute-style FunctionCall payload (current ADK SDK)."""
+class _Tool:
+    """Duck-typed ADK tool declaration (``.name`` is the raw MCP tool name)."""
     def __init__(self, name):
         self.name = name
 
 
-class _FcPart:
-    """Duck-typed ADK function-call part (Attribute-style FC)."""
-    def __init__(self, name):
-        self.function_call = _Fc(name)
+class _SyncToolset:
+    """Fake McpToolset whose ``get_tools()`` is synchronous."""
+    def __init__(self, *names):
+        self._names = names
+
+    def get_tools(self):
+        return [_Tool(n) for n in self._names]
 
 
-class _FcDictPart:
-    """Duck-typed ADK function-call part (dict-style FC; older SDK shape).
+class _AsyncToolset:
+    """Fake McpToolset whose ``get_tools()`` is a coroutine (ADK shape)."""
+    def __init__(self, *names):
+        self._names = names
 
-    The caller passes the FC dict directly (e.g. ``{"name": "..."}``) — assign
-    as-is. Wrapping again (e.g. ``{"name": fc_dict}``) would double-nest and
-    break the ``fc.get("name")`` path in the helper.
-    """
-    def __init__(self, name):
-        self.function_call = name
+    async def get_tools(self):
+        return [_Tool(n) for n in self._names]
 
 
-class _Content:
-    def __init__(self, parts):
-        self.parts = parts
-
-
-class _FcEvent:
-    def __init__(self, *fc_names):
-        self.content = _Content([_FcPart(n) if not isinstance(n, dict) else _FcDictPart(n) for n in fc_names])
-
-
-def test_extract_loaded_mcp_tools_reads_function_call_names():
-    # Single event with 3 function-call parts in invocation order
-    events = [
-        _FcEvent("mcp__molecule-platform__list_peers", "mcp__molecule-platform__commit_memory", "mcp__molecule-platform__recall_memory"),
-    ]
-    assert extract_loaded_mcp_tools(events) == [
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_expands_sync_toolset():
+    # Raw MCP names returned by ADK's McpToolset get_tools() are normalised to
+    # the platform namespaced IDs the controlplane gate expects.
+    assert await extract_loaded_mcp_tools([
+        _SyncToolset(
+            "list_peers",
+            "commit_memory",
+            "create_workspace",
+        )
+    ]) == [
         "mcp__molecule-platform__list_peers",
         "mcp__molecule-platform__commit_memory",
+        "mcp__molecule-platform__create_workspace",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_expands_async_toolset():
+    assert await extract_loaded_mcp_tools([
+        _AsyncToolset("send_message_to_user")
+    ]) == ["mcp__molecule-platform__send_message_to_user"]
+
+
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_ignores_non_mcp_tools():
+    class _OtherTool:
+        name = "some_builtin_tool"
+    assert await extract_loaded_mcp_tools([_OtherTool(), _SyncToolset("recall_memory")]) == [
         "mcp__molecule-platform__recall_memory",
     ]
 
 
-def test_extract_loaded_mcp_tools_dedupes_across_events():
-    # The same tool may be re-invoked across turns; dedup preserves invocation
-    # order, not most-recent-seen.
-    events = [
-        _FcEvent("mcp__molecule-platform__list_peers"),
-        _FcEvent("mcp__molecule-platform__commit_memory"),
-        _FcEvent("mcp__molecule-platform__list_peers"),  # duplicate
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_dedupes_across_toolsets():
+    toolsets = [
+        _SyncToolset("list_peers"),
+        _SyncToolset("list_peers", "commit_memory"),
     ]
-    assert extract_loaded_mcp_tools(events) == [
+    assert await extract_loaded_mcp_tools(toolsets) == [
         "mcp__molecule-platform__list_peers",
         "mcp__molecule-platform__commit_memory",
     ]
 
 
-def test_extract_loaded_mcp_tools_handles_dict_shaped_fc():
-    # Older ADK SDKs expose FC as a dict, not an attribute — handle both.
-    events = [_FcEvent({"name": "mcp__molecule-platform__create_workspace"})]
-    assert extract_loaded_mcp_tools(events) == [
-        "mcp__molecule-platform__create_workspace"
-    ]
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_empty_when_no_toolset_loaded():
+    assert await extract_loaded_mcp_tools([]) == []
+    assert await extract_loaded_mcp_tools(None) == []
 
 
-def test_extract_loaded_mcp_tools_returns_empty_when_no_function_calls():
-    # No tools invoked (model answered directly) → empty list, not an error.
-    events = [_Event(texts=["just a plain text reply"])]
-    assert extract_loaded_mcp_tools(events) == []
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_create_workspace_is_in_inventory():
+    """#3082 recovery: the required tool must be reported when the toolset is
+    loaded, even if the sample turn never invokes it."""
+    assert "mcp__molecule-platform__create_workspace" in await extract_loaded_mcp_tools([
+        _SyncToolset(
+            "list_peers",
+            "commit_memory",
+            "create_workspace",
+        )
+    ])
 
 
-def test_extract_loaded_mcp_tools_handles_no_content():
-    class _Bare:
-        pass
-    assert extract_loaded_mcp_tools([_Bare()]) == []
-
-
-# ---------------------------------------------------------------------------
-# core#3082 regression (the production lazy-init path) — proves the hook
-# observes what ADK actually loaded when no tools were pre-seeded by the
-# test. The previous "pre-seeded resumeGuard" test shipped green while the
-# real bug lived in the lazy-init path; this is the corrected contract.
-# ---------------------------------------------------------------------------
-
-def test_3082_production_path_reports_loaded_tools_from_real_event_stream():
-    """End-to-end: real first turn events with NO pre-seeding → the helper
-    records exactly the tool ids ADK actually loaded, in invocation order."""
-    from google_adk_executor import extract_loaded_mcp_tools
-
-    # The 3 specific tools this concierge invocation called (per the core#3082
-    # RCA): the platform's a2a_mcp_server, exposed via the runtime's McpToolset.
-    events = [
-        _FcEvent("mcp__molecule-platform__list_peers"),
-        _FcEvent("mcp__molecule-platform__commit_memory"),
-        _FcEvent("mcp__molecule-platform__send_message_to_user"),
-    ]
-    observed = extract_loaded_mcp_tools(events)
-    assert observed == [
+@pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_skip_failing_toolset():
+    """A toolset that fails to enumerate must not crash extraction."""
+    class _Boom:
+        def get_tools(self):
+            raise RuntimeError("mcp server not ready")
+    assert await extract_loaded_mcp_tools([_Boom(), _SyncToolset("list_peers")]) == [
         "mcp__molecule-platform__list_peers",
-        "mcp__molecule-platform__commit_memory",
-        "mcp__molecule-platform__send_message_to_user",
     ]
-    # Configured-but-not-loaded is NOT observable here: that distinction is
-    # exactly what the lazy-init producer captures. If a future config
-    # change adds a tool to McpToolset but the server fails to load it, the
-    # observed list won't include it — that's the contract core#3079/#3082
-    # needs to be fail-loud (degraded) about.
-    assert "mcp__molecule-platform__create_workspace" not in observed  # not in this turn
-
-
-def test_3082_present_only_stays_degraded():
-    """Configuration present (mcp_server_present=true) but NO turn has run
-    yet → loaded_mcp_tools stays None → core's online gate degrades. The
-    contract: we don't report a guessed/static list, only the live one.
-    """
-    # Simulate the heartbeat gate payload contract:
-    captured_loaded = [None]  # sentinel: no turn has run
-
-    def fake_set_loaded(tools):
-        captured_loaded[0] = tools
-
-    # No events = no turns = no tools recorded. The runtime must NOT
-    # report a guessed list — it stays None.
-    extract_loaded_result = extract_loaded_mcp_tools([])
-    fake_set_loaded(extract_loaded_result)
-    assert captured_loaded[0] == [], (
-        "Without a turn, loaded_mcp_tools must stay empty/None. Reporting a "
-        "guessed list (e.g. from McpToolset config) would re-open core#3082."
-    )
 
 def test_is_final_detects_terminal_event():
     assert is_final(_Event(final=True)) is True

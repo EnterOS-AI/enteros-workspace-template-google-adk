@@ -17,6 +17,7 @@ deferred (gated no-op) — see the RFC's "out of scope" section.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from collections.abc import Iterable
@@ -26,6 +27,11 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 
 logger = logging.getLogger(__name__)
+
+# Platform MCP server slug used to turn raw MCP tool names (e.g. ``create_workspace``)
+# into the namespaced platform IDs (``mcp__molecule-platform__create_workspace``)
+# the controlplane's online/degraded gate expects.
+_PLATFORM_MCP_SERVER = "molecule-platform"
 
 
 # ---------------------------------------------------------------------------
@@ -93,40 +99,54 @@ def sanitize_error(exc: Exception) -> str:
     return f"[A2A_ERROR] google-adk runtime error: {first_line}"
 
 
-def extract_loaded_mcp_tools(events) -> list[str]:
-    """Return the loaded MCP tool ids the ADK run actually invoked.
+async def extract_loaded_mcp_tools(tools) -> list[str]:
+    """Return the loaded MCP tool ids from the ADK agent's tool inventory.
 
-    ADK events carry function-call parts (a ``function_call.name`` per part)
-    for every tool the agent called. After the first turn runs, this is
-    the ground-truth "what the agent actually had available" — distinct
-    from the configured list (which the runtime may have requested but the
-    toolset didn't actually load). Normalising: ADK prefixes MCP tools
-    with the server id (``mcp__<server>__<action>``); pass through unchanged.
-    Duck-typed on parts because ADK's part shape drifts between SDK
-    minor versions and we don't import google.adk here.
+    ``tools`` is ``agent.tools`` — for the platform concierge this contains one
+    or more ``McpToolset`` objects. Each ``McpToolset`` exposes ``get_tools()``
+    (sync or async) returning the actually-loaded tool declarations. ADK returns
+    their raw MCP names (e.g. ``create_workspace``); we normalise them to the
+    platform IDs the controlplane gate expects, such as
+    ``mcp__molecule-platform__create_workspace``. Non-MCP tools are ignored.
+
+    Duck-typed and defensive: we never import ``google.adk`` here, and a
+    toolset that fails to enumerate is skipped rather than crashing the turn.
     """
+    result: list[str] = []
     seen: set[str] = set()
-    order: list[str] = []
-    for event in events:
-        content = getattr(event, "content", None)
-        parts = getattr(content, "parts", None) or []
-        for part in parts:
-            # The mcp__* function-call shape: ``part.function_call.name`` is
-            # the canonical ADK FieldPath. Older SDKs nest under
-            # ``part.function_call['name']`` (dict-like) — handle both.
-            fc = getattr(part, "function_call", None)
-            if fc is None:
+
+    for tool in tools or []:
+        sub_tools: list[Any] = []
+        get_tools = getattr(tool, "get_tools", None)
+        if callable(get_tools):
+            try:
+                maybe_tools = get_tools()
+                if inspect.iscoroutine(maybe_tools):
+                    maybe_tools = await maybe_tools
+                sub_tools = list(maybe_tools or [])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "extract_loaded_mcp_tools: toolset enumeration failed: %s",
+                    exc,
+                )
                 continue
-            name = getattr(fc, "name", None) or (
-                fc.get("name") if isinstance(fc, dict) else None
-            )
+        else:
+            # ``agent.tools`` may contain LangChain-style builtins or already-
+            # expanded tools; only MCP toolset inventories are reported here.
+            continue
+
+        for t in sub_tools:
+            name = getattr(t, "name", None)
             if not isinstance(name, str) or not name:
                 continue
-            if name in seen:
-                continue
-            seen.add(name)
-            order.append(name)
-    return order
+            # Normalise raw MCP tool names to the platform namespaced ID.
+            if not name.startswith("mcp__"):
+                name = f"mcp__{_PLATFORM_MCP_SERVER}__{name}"
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+
+    return result
 
 
 def extract_incoming_text(context, primary) -> str:
@@ -169,12 +189,13 @@ class GoogleADKA2AExecutor(AgentExecutor):
     via ``set_current_task`` brackets every turn.
     """
 
-    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None):
+    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None, tools=None):
         self._runner = runner
         self._app_name = app_name
         self._user_id = user_id
         self._model = model
         self._heartbeat = heartbeat
+        self._tools = tools or []
 
     async def _ensure_session(self, session_id: str) -> None:
         svc = self._runner.session_service
@@ -241,17 +262,16 @@ class GoogleADKA2AExecutor(AgentExecutor):
             await self._ensure_session(context_id)
             await updater.start_work()
 
+            # core#3082: enumerate the actually-loaded MCP tool inventory from the
+            # agent's toolset(s). This is the available-tool inventory, independent
+            # of whether the current turn invokes any particular tool.
+            loaded_tools = await extract_loaded_mcp_tools(self._tools)
+
             new_message = types.Content(role="user", parts=[types.Part(text=user_input)])
             events = self._runner.run_async(
                 user_id=self._user_id, session_id=context_id, new_message=new_message
             )
-            final_text, loaded_tools = await self._drain(events, updater, Part)
-            # core#3082: report the actually-loaded MCP tool ids from this
-            # turn to the platform. ADK's event stream carries function-call
-            # parts naming each invoked tool — ground truth (the configured
-            # toolset can request a tool that the server never actually
-            # loaded). Report once per turn, after the first response, so
-            # the gate sees live evidence rather than configured intent.
+            final_text = await self._drain(events, updater, Part)
             from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
             set_loaded_mcp_tools(loaded_tools)
             # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
@@ -279,15 +299,13 @@ class GoogleADKA2AExecutor(AgentExecutor):
             # Clear the in-flight task so heartbeat active_tasks decrements.
             await set_current_task(self._heartbeat, None)
 
-    async def _drain(self, events, updater, Part) -> tuple[str, list[str]]:
-        """Async-drain ADK's event stream, emit artifacts, return final text + loaded MCP tools."""
+    async def _drain(self, events, updater, Part) -> str:
+        """Async-drain ADK's event stream, emit artifacts, return final text."""
         final_text = ""
         streamed: list[str] = []
         artifact_id = str(uuid.uuid4())
         has_streamed = False
-        collected_events: list[Any] = []
         async for event in events:
-            collected_events.append(event)
             texts = extract_event_text(event)
             if is_final(event):
                 final_text = "".join(texts)
@@ -298,8 +316,7 @@ class GoogleADKA2AExecutor(AgentExecutor):
                         parts=[Part(text=t)], artifact_id=artifact_id, append=has_streamed
                     )
                     has_streamed = True
-        loaded_tools = extract_loaded_mcp_tools(collected_events)
-        return final_text or "".join(streamed), loaded_tools
+        return final_text or "".join(streamed)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # ADK's in-memory Runner has no mid-run cancellation hook; the A2A

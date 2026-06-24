@@ -173,6 +173,7 @@ class GoogleADKAdapter(BaseAdapter):
             user_id=user_id,
             model=self._resolved.model,
             heartbeat=config.heartbeat,
+            tools=agent.tools,
         )
 
 
