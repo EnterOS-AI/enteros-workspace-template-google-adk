@@ -14,9 +14,10 @@ runtime: google-adk
 runtime_config:
   # Platform-managed by default: keyless, metered Gemini via Molecule's LLM
   # proxy (no GOOGLE_API_KEY needed). `platform:gemini-2.5-pro` resolves to the
-  # closed `platform` provider in the registry SSOT (cp#511/core#2182) ->
-  # platform_managed billing + required_env=[] (DERIVED, not hand-authored).
-  # BYOK options in models[] below.
+  # closed `platform` provider in the registry SSOT (cp#511/core#2182).
+  # _routing.py routes through the proxy purely because provider==platform (the
+  # `platform:`/`vertex:` namespace) — NOT a billing-mode env. required_env=[]
+  # is DERIVED, not hand-authored. BYOK options in models[] below.
   model: platform:gemini-2.5-pro
   required_env: []
 
