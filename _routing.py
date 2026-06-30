@@ -83,19 +83,30 @@ def resolve_model(model_str: str, env: Mapping[str, str]) -> ResolvedModel:
     )
 
     # Platform-managed (metered, keyless) routing via Molecule's OpenAI-
-    # compatible LLM proxy. Triggered by an explicit platform:/molecule:/
-    # vertex: prefix, or by the GOOGLE_GENAI_USE_VERTEXAI opt-in on a Gemini
-    # model. EVERY "serve via Vertex" path now goes through the proxy — which
-    # mints the Vertex credential server-side (no Google credential ever
-    # reaches this tenant box; this is the keyless-Vertex leak fix) and meters
-    # usage to org credits — instead of the old on-box ADC. The platform
-    # injects OPENAI_BASE_URL (CP proxy) + OPENAI_API_KEY (org usage token)
-    # into every workspace via /tenants/config. LiteLlm's "openai/<id>" form
-    # sends the bare id to the proxy, which resolves it to Vertex (cp
-    # llm_proxy.go google/vertex case).
-    use_platform = prefix in _PLATFORM_PREFIXES or (
-        is_gemini and _is_truthy(env.get("GOOGLE_GENAI_USE_VERTEXAI"))
-    )
+    # compatible LLM proxy. Triggered by the SSOT signal
+    # MOLECULE_RESOLVED_PROVIDER == "platform" (TOP PRECEDENCE — core's
+    # provisioner resolves the provider ONCE via Go manifest.DeriveProvider and
+    # publishes the registry arm name here for every layer to READ, never
+    # re-derive), or — only when that signal is ABSENT — by the legacy explicit
+    # platform:/molecule:/vertex: model prefix, or the GOOGLE_GENAI_USE_VERTEXAI
+    # opt-in on a Gemini model. When the SSOT signal is set but names a non-
+    # platform (byok) arm, the model namespace must NOT re-promote it to
+    # platform — it falls through to the BYOK (AI Studio / LiteLlm) paths below.
+    # EVERY "serve via Vertex" path goes through the proxy — which mints the
+    # Vertex credential server-side (no Google credential ever reaches this
+    # tenant box; this is the keyless-Vertex leak fix) and meters usage to org
+    # credits — instead of the old on-box ADC. The platform injects
+    # OPENAI_BASE_URL (CP proxy) + OPENAI_API_KEY (org usage token) into every
+    # workspace via /tenants/config. LiteLlm's "openai/<id>" form sends the bare
+    # id to the proxy, which resolves it to Vertex (cp llm_proxy.go
+    # google/vertex case).
+    resolved_provider = (env.get("MOLECULE_RESOLVED_PROVIDER") or "").strip().lower()
+    if resolved_provider:
+        use_platform = (resolved_provider == "platform")
+    else:
+        use_platform = prefix in _PLATFORM_PREFIXES or (
+            is_gemini and _is_truthy(env.get("GOOGLE_GENAI_USE_VERTEXAI"))
+        )
     if use_platform:
         if not env.get("OPENAI_BASE_URL") or not env.get("OPENAI_API_KEY"):
             raise RuntimeError(
