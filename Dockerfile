@@ -43,9 +43,7 @@ ARG RUNTIME_VERSION=
 # win and get baked into the image (the legacy `molecule-ai-workspace-runtime`
 # is squatted with 136 releases incl version-bombs like 0.1.999999). The runtime
 # dist is also renamed to `molecules-workspace-runtime` (404 on public PyPI →
-# resolvable ONLY from our registry). The Gitea index transparently proxies
-# public PyPI for the transitive deps (pyyaml, starlette, python-multipart, …),
-# so --index-url alone resolves the full requirements set.
+# resolvable ONLY from our registry).
 #
 # The ARG is deliberately NOT named PIP_INDEX_URL: Docker exports build ARGs
 # into the RUN environment, and pip reads a PIP_INDEX_URL env var — which would
@@ -54,11 +52,22 @@ ARG RUNTIME_VERSION=
 # Gitea index and break the build. Scoping the index to the two runtime
 # installs via an explicit flag keeps google-adk on public PyPI.
 ARG MOLECULE_RUNTIME_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+# Public deps (python-multipart, a2a-sdk, and the private runtime's public
+# transitive deps) live on PyPI, not the private Gitea PyPI index — the Gitea
+# index does NOT proxy public PyPI (the earlier "transparently proxies"
+# behavior is gone post-migration), so --index-url alone dies with
+# "No matching distribution found for python-multipart". Add pypi.org as an
+# --extra-index-url (NOT --index-url) so the PRIVATE Gitea index stays the
+# PRIMARY resolver for the private molecules-workspace-runtime dist (absent
+# from public PyPI → no dependency-confusion). Matches the accepted pattern
+# already shipped in the hermes/langgraph/claude-code templates (RFC
+# internal#596).
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --index-url "${MOLECULE_RUNTIME_INDEX_URL}" -r requirements.txt && \
+RUN pip install --no-cache-dir --index-url "${MOLECULE_RUNTIME_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${MOLECULE_RUNTIME_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${MOLECULE_RUNTIME_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 # Google ADK from PyPI.
