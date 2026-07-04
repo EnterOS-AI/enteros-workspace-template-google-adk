@@ -1,92 +1,29 @@
-"""Shared pytest fixtures + import shims for the adapter test suite.
+"""Make the template root importable from tests/.
 
-`adapter.py` imports at module load:
-  - molecule_runtime.adapters.base (BaseAdapter, AdapterConfig, RuntimeCapabilities)
-  - molecule_runtime.plugins (lazy in setup(), but stubbed proactively)
-  - a2a.server.agent_execution (AgentExecutor, RequestContext)
-  - a2a.server.events (EventQueue)
-  - google_adk_executor (real sibling module; imports the a2a stubs above)
+The repo keeps adapter.py / _routing.py / google_adk_executor.py at the root
+(not under a package dir), so inject the root on sys.path. tests/pytest.ini
+anchors pytest's rootdir here so the root __init__.py (which does a
+package-relative ``from .adapter import`` for runtime discovery) is never
+collected.
 
-In production those arrive transitively via molecule-ai-workspace-runtime.
-The CI runner only installs `pytest pytest-asyncio pyyaml`, so the import
-chain would fail with ModuleNotFoundError before any test collects —
-exactly the failure that broke CI on the #180 fix branch (PR #4) and
-caused the merge wall to block on a green local but red Gitea CI.
-
-Putting the stub installer here (collected before any test module is
-imported, per pytest semantics) means every test file can do
-`from adapter import ...` at module top without a per-file boilerplate
-copy. It also forces a single shape for the stubs so two files can't
-silently disagree on whether `BaseAdapter` has
-`install_plugins_via_registry` (see test_adapter_prevalidate's
-async-setup tests, which need the method to exist on the parent class).
+No molecule_runtime / a2a stubs are installed. After the tenant-agent BUG 3
+migration, google_adk_executor.py inherits the shared ``SubprocessA2AExecutor``
+base from molecule-ai-workspace-runtime, so the session/history contract and the
+pure-helper tests must exercise the REAL base (installed in CI's
+Adapter-unit-tests job via the private PyPI index). When the runtime is absent —
+or too old to carry the base (pre runtime #222) — those two test modules
+``pytest.importorskip`` themselves at import time, while the runtime-independent
+_routing / Dockerfile tests keep running. This mirrors template-openclaw #139,
+which dropped its per-file stubs for the same reason.
 """
 
 import os
 import sys
-import types
-from dataclasses import dataclass
-from unittest.mock import MagicMock
 
-
-@dataclass
-class _StubRuntimeCapabilities:
-    provides_native_session: bool = False
-
-
-@dataclass
-class _StubAdapterConfig:
-    runtime_config: object = None
-    config_path: str = "/tmp/configs"
-    system_prompt: str = ""
-    heartbeat: object = None
-    workspace_id: str = ""
-    model: str = "google_genai:gemini-2.5-pro"
-
-
-class _StubBaseAdapter:
-    async def install_plugins_via_registry(self, *_args, **_kwargs):
-        pass
-
-
-def _install_stubs() -> None:
-    """Install the smallest set of import shims that adapter.py needs."""
-    if "molecule_runtime" not in sys.modules:
-        mr = types.ModuleType("molecule_runtime")
-        mr.adapters = types.ModuleType("molecule_runtime.adapters")
-        mr.adapters.base = types.ModuleType("molecule_runtime.adapters.base")
-        mr.adapters.base.BaseAdapter = _StubBaseAdapter
-        mr.adapters.base.AdapterConfig = _StubAdapterConfig
-        mr.adapters.base.RuntimeCapabilities = _StubRuntimeCapabilities
-        mr.plugins = types.ModuleType("molecule_runtime.plugins")
-        mr.plugins.load_plugins = lambda **_kwargs: []
-        sys.modules["molecule_runtime"] = mr
-        sys.modules["molecule_runtime.adapters"] = mr.adapters
-        sys.modules["molecule_runtime.adapters.base"] = mr.adapters.base
-        sys.modules["molecule_runtime.plugins"] = mr.plugins
-    if "a2a" not in sys.modules:
-        a2a = types.ModuleType("a2a")
-        a2a.server = types.ModuleType("a2a.server")
-        a2a.server.agent_execution = types.ModuleType("a2a.server.agent_execution")
-        a2a.server.agent_execution.AgentExecutor = type("AgentExecutor", (), {})
-        a2a.server.agent_execution.RequestContext = type("RequestContext", (), {})
-        a2a.server.events = types.ModuleType("a2a.server.events")
-        a2a.server.events.EventQueue = type("EventQueue", (), {})
-        sys.modules["a2a"] = a2a
-        sys.modules["a2a.server"] = a2a.server
-        sys.modules["a2a.server.agent_execution"] = a2a.server.agent_execution
-        sys.modules["a2a.server.events"] = a2a.server.events
-
-
-# Run at conftest import time — pytest collects conftest.py before any
-# test module, so the stubs are in sys.modules before `from adapter
-# import ...` ever executes.
-_install_stubs()
-
-# adapter.py lives in the parent dir of tests/ (template root). pytest's
-# `--import-mode=importlib` + tests/pytest.ini anchoring rootdir at
-# tests/ means the parent isn't on sys.path automatically. Add it here
-# once so every test file can do `from adapter import ...` cleanly.
+# adapter.py / _routing.py / google_adk_executor.py live in the parent dir of
+# tests/ (template root). pytest's --import-mode=importlib + the tests/pytest.ini
+# rootdir anchor means the parent isn't on sys.path automatically. Add it once so
+# every test file can do `from adapter import ...` / `from _routing import ...`.
 _PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT_DIR not in sys.path:
     sys.path.insert(0, _PARENT_DIR)

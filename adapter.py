@@ -174,6 +174,10 @@ class GoogleADKAdapter(BaseAdapter):
             model=self._resolved.model,
             heartbeat=config.heartbeat,
             tools=agent.tools,
+            # WORKSPACE_ID-first stable session identity (tenant-agent BUG 3):
+            # the base derives the ADK session id from this, not the per-request
+            # context_id, so a conversation resumes the same ADK session.
+            workspace_id=config.workspace_id,
         )
 
 

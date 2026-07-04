@@ -4,27 +4,59 @@ Molecule-authored (NOT ADK's native ``A2aAgentExecutor``): ADK pins
 ``a2a-sdk<0.4`` for its a2a layer, while the platform's A2A server is on
 ``a2a-sdk>=1.0`` — incompatible. So we use ADK purely as the agent engine
 (``LlmAgent`` + ``Runner`` + ``McpToolset``) and bridge its ``Runner``
-event stream onto the platform's a2a-1.x ``EventQueue``/``TaskUpdater``
-ourselves — the same shape ``LangGraphA2AExecutor`` uses.
+event stream onto the platform's a2a-1.x model.
 
-Platform-citizen scope (RFC internal#730, approved): the A2A event
-contract + heartbeat task accounting (``set_current_task``) are
-implemented here because they are load-bearing (online/busy/offline
-recovery + scheduler concurrency). OWASP compliance, OTEL spans, and the
-Temporal durable wrapper are OFF/dormant in production today, so they are
-deferred (gated no-op) — see the RFC's "out of scope" section.
+tenant-agent BUG 3 — inherit the SHARED session CONTRACT
+========================================================
+This executor used to hand-roll ``AgentExecutor.execute()`` and, like every
+other subprocess/one-shot runtime, silently diverged from the platform's
+session contract:
+
+  * it keyed the ADK session on the per-request ``context_id`` (execute()
+    passed ``session_id=context_id`` to ``Runner.run_async``), which the
+    a2a-sdk mints FRESH each turn when the canvas threads none — so ADK's
+    ``InMemorySessionService`` opened a NEW session every message and the
+    agent re-greeted with no memory of the prior turn.
+
+That contract is now INHERITED from the SSOT base ``SubprocessA2AExecutor``
+(``molecule_runtime.subprocess_executor``): the base's ``execute()`` derives a
+STABLE, WORKSPACE_ID-keyed session id (``derive_session_id``) so ADK's own
+``InMemorySessionService`` RESUMES the same session across turns — that native
+session IS the continuity. The base deliberately passes ONLY the current user
+message to ``run_agent``; it does NOT force-inject ``metadata.history`` into the
+task text (that double-fed context alongside the native session and grew the
+prompt unboundedly). Older/other history is retrieved only if the agent CHOOSES
+to call the platform-workspace ``get_conversation_history`` MCP tool — never
+shoved into every turn.
+
+This class is a THIN subclass that implements ONLY ``run_agent`` — the ADK
+``Runner`` shell-out — and MUST NOT override ``execute()`` (the base's shared
+contract test is the tripwire that enforces this).
+
+Platform-citizen scope (RFC internal#730): heartbeat task accounting is handled
+by the base (``set_current_task`` brackets every turn via the injected
+heartbeat). The loaded-MCP-tool inventory (core#3082) and the OFFSEC-003 error
+sanitisation remain here because they are ADK-specific.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
-import uuid
 from collections.abc import Iterable
 from typing import Any
 
-from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue
+# The shared subprocess-executor base (tenant-agent BUG 3): the session
+# CONTRACT — a STABLE, WORKSPACE_ID-keyed session id, with continuity supplied by
+# the runtime's OWN native session (NOT a force-injected transcript) — lives ONCE
+# in the SSOT runtime SDK so every subprocess/one-shot runtime inherits it.
+# GoogleADKA2AExecutor below is a thin subclass that provides ONLY the ADK Runner
+# shell-out (run_agent). It is a hard import (no fallback): the base ships with
+# molecule-ai-workspace-runtime, and a runtime too old to carry it must fail
+# loudly rather than silently run WITHOUT the enforced contract. (Deploy
+# ordering: runtime #222 releases the base before this template's image pins a
+# runtime that has it.)
+from molecule_runtime.subprocess_executor import SubprocessA2AExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -149,52 +181,45 @@ async def extract_loaded_mcp_tools(tools) -> list[str]:
     return result
 
 
-def extract_incoming_text(context, primary) -> str:
-    """Resolve the user's text (and any attachment manifest) for this turn.
-
-    ``primary`` is the platform's ``extract_message_text`` — it is
-    attachment-aware (emits the ``Attached files:`` manifest with local paths,
-    the only channel that tells the agent a file exists) and resolves correctly
-    on the pinned a2a-sdk 1.0.3. It runs FIRST so a text+attachment message
-    never loses its files.
-
-    Only when ``primary`` yields nothing do we fall back to the a2a SDK's own
-    ``context.get_user_input()`` — a version-stable safety net for the failure
-    mode that triggered this fix: on a2a-sdk 1.1.0 ``extract_message_text``
-    silently returned ``""`` (part shape changed) and every turn errored with
-    "no text content" (e2e-found 2026-05-29). The fallback recovers the text
-    (attachments would be unavailable in that degraded path, but a future SDK
-    bump no longer hard-breaks the turn). Pure: ``context`` duck-typed,
-    ``primary`` injected.
-    """
-    text = primary(context)
-    if text:
-        return text
-    try:
-        return (context.get_user_input() or "").strip()
-    except Exception:  # noqa: BLE001 — older/edge SDKs lack it
-        return ""
-
-
 # ---------------------------------------------------------------------------
-# Executor
+# Executor — a THIN SubprocessA2AExecutor subclass (tenant-agent BUG 3)
 # ---------------------------------------------------------------------------
 
-class GoogleADKA2AExecutor(AgentExecutor):
-    """Bridges an ADK ``Runner`` to the platform's a2a-1.x event model.
+class GoogleADKA2AExecutor(SubprocessA2AExecutor):
+    """Drives an ADK ``Runner`` for one A2A turn.
 
-    One ADK session per A2A ``context_id`` (created lazily). Emits a
-    ``working`` status, streams intermediate text as artifacts, and returns
-    the final response as a terminal A2A message. Heartbeat task accounting
-    via ``set_current_task`` brackets every turn.
+    The session CONTRACT is INHERITED from ``SubprocessA2AExecutor``: the base's
+    ``execute()`` derives a STABLE, WORKSPACE_ID-keyed session id
+    (``derive_session_id``) — NOT the per-request ``context_id`` the a2a-sdk mints
+    fresh each turn — and passes ONLY the current user message through (it does
+    NOT force-inject conversation history). This class provides ONLY
+    ``run_agent`` — the ADK ``Runner.run_async`` shell-out keyed on that stable
+    session id, so ADK's ``InMemorySessionService`` RESUMES the same session and
+    that native session supplies the continuity.
+
+    It MUST NOT override ``execute()``; the contract lives in the base and is
+    guarded by the shared contract test.
     """
 
-    def __init__(self, runner, *, app_name: str, user_id: str, model: str = "unknown", heartbeat=None, tools=None):
+    runtime_label = "google-adk"
+
+    def __init__(
+        self,
+        runner,
+        *,
+        app_name: str,
+        user_id: str,
+        model: str = "unknown",
+        heartbeat=None,
+        tools=None,
+        workspace_id: str = "",
+    ):
+        # WORKSPACE_ID-first stable identity + heartbeat live in the base.
+        super().__init__(workspace_id=workspace_id, heartbeat=heartbeat)
         self._runner = runner
         self._app_name = app_name
         self._user_id = user_id
         self._model = model
-        self._heartbeat = heartbeat
         self._tools = tools or []
 
     async def _ensure_session(self, session_id: str) -> None:
@@ -207,118 +232,49 @@ class GoogleADKA2AExecutor(AgentExecutor):
                 app_name=self._app_name, user_id=self._user_id, session_id=session_id
             )
 
-    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        from a2a.helpers import new_text_message
-        from a2a.server.tasks import TaskUpdater
-        from a2a.types import Part, Task, TaskStatus
+    async def run_agent(self, task_text: str, session_id: str, context) -> str:
+        """Run one ADK turn and return its final text (base template method).
+
+        Args:
+            task_text: the CURRENT user message — passed straight to ADK as the
+                new ``user`` content. NO conversation history is prepended: the
+                base does not inject a transcript, and continuity comes from the
+                native ADK session resumed via ``session_id`` (tenant-agent BUG 3).
+            session_id: the STABLE, WORKSPACE_ID-keyed session id from the base
+                (``derive_session_id``). Passed to ADK's session so its
+                ``InMemorySessionService`` RESUMES the same session across turns
+                instead of opening a new one per request.
+            context: the raw A2A RequestContext (unused here — the base already
+                extracted the current message).
+        """
         from google.genai import types
+        from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
 
-        from molecule_runtime.adapters.shared_runtime import (
-            brief_task,
-            extract_message_text,
-            set_current_task,
-        )
-        from molecule_runtime.executor_helpers import task_state_value
+        # core#3082: report the actually-loaded MCP tool INVENTORY (independent
+        # of whether this turn invokes any tool). Reported up front so the
+        # platform's online/degraded gate sees it even if the turn later errors.
+        set_loaded_mcp_tools(await extract_loaded_mcp_tools(self._tools))
 
-        # extract_message_text (attachment-aware) first, context.get_user_input()
-        # as the SDK-version-stable empty-result fallback — see extract_incoming_text doc.
-        user_input = extract_incoming_text(context, extract_message_text)
-        if not user_input:
-            await event_queue.enqueue_event(
-                new_text_message("Error: message contained no text content.")
-            )
-            return
-
-        task_id = context.task_id or str(uuid.uuid4())
-        context_id = context.context_id or str(uuid.uuid4())
-
-        # A2A v1 contract (a2a-sdk >= 1.0): a Task must be enqueued before any
-        # TaskStatusUpdateEvent. The SDK auto-creates the Task only for
-        # continuation messages (existing task resolves via the task manager);
-        # for a FRESH request context.current_task is None and the first
-        # updater.start_work() is rejected with InvalidAgentResponseError
-        # "Agent should enqueue Task before TaskStatusUpdateEvent event". Mirror
-        # the platform reference executor: enqueue a SUBMITTED Task first.
-        # (e2e-found 2026-05-30 — only reachable once the incoming-text fix let
-        # execution proceed past extraction.)
-        if getattr(context, "current_task", None) is None:
-            # task_state_value resolves TASK_STATE_SUBMITTED across the SDK's
-            # protobuf TaskState (TaskState.Value(name)) and test-stub shapes —
-            # the platform's TaskState is a protobuf enum, NOT a Python enum, so
-            # TaskState.submitted does not exist. Mirrors the reference executor.
-            await event_queue.enqueue_event(
-                Task(
-                    id=task_id,
-                    context_id=context_id,
-                    status=TaskStatus(state=task_state_value("TASK_STATE_SUBMITTED")),
-                )
-            )
-
-        updater = TaskUpdater(event_queue, task_id, context_id)
-
-        # Heartbeat task accounting — load-bearing (online/busy/offline + scheduler).
-        await set_current_task(self._heartbeat, brief_task(user_input))
         try:
-            await self._ensure_session(context_id)
-            await updater.start_work()
-
-            # core#3082: enumerate the actually-loaded MCP tool inventory from the
-            # agent's toolset(s). This is the available-tool inventory, independent
-            # of whether the current turn invokes any particular tool.
-            loaded_tools = await extract_loaded_mcp_tools(self._tools)
-
-            new_message = types.Content(role="user", parts=[types.Part(text=user_input)])
+            await self._ensure_session(session_id)
+            new_message = types.Content(role="user", parts=[types.Part(text=task_text)])
             events = self._runner.run_async(
-                user_id=self._user_id, session_id=context_id, new_message=new_message
+                user_id=self._user_id, session_id=session_id, new_message=new_message
             )
-            final_text = await self._drain(events, updater, Part)
-            from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
-            set_loaded_mcp_tools(loaded_tools)
-            # A2A v1 (a2a-sdk >= 1.0): once a Task is enqueued (above) the
-            # executor is in TASK MODE, where a raw Message enqueue is rejected
-            # ("Received Message object in task mode. Use TaskStatusUpdateEvent
-            # or TaskArtifactUpdateEvent instead.", JSON-RPC -32603 — e2e-found
-            # 2026-05-30). The terminal reply must go through updater.complete(),
-            # which wraps the Message in a COMPLETED TaskStatusUpdateEvent.
-            # Mirrors the platform reference executor (a2a_executor.py:674).
-            await updater.complete(
-                message=new_text_message(
-                    final_text or "(no response)", task_id=task_id, context_id=context_id
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 — SDK errors are sanitised, never raised to A2A
-            logger.exception("google-adk execute failed for context %s", context_id)
-            # Task mode: terminal errors publish a FAILED TaskStatusUpdateEvent
-            # via updater.failed(), not a raw Message enqueue (same -32603 rule).
-            await updater.failed(
-                message=new_text_message(
-                    sanitize_error(exc), task_id=task_id, context_id=context_id
-                )
-            )
-        finally:
-            # Clear the in-flight task so heartbeat active_tasks decrements.
-            await set_current_task(self._heartbeat, None)
+            final_text = await self._drain(events)
+            return final_text or "(no response)"
+        except Exception as exc:  # noqa: BLE001 — never leak a Google SDK trace to A2A
+            logger.exception("google-adk run_agent failed for session %s", session_id)
+            return sanitize_error(exc)
 
-    async def _drain(self, events, updater, Part) -> str:
-        """Async-drain ADK's event stream, emit artifacts, return final text."""
+    async def _drain(self, events) -> str:
+        """Async-drain ADK's event stream and return the final text."""
         final_text = ""
         streamed: list[str] = []
-        artifact_id = str(uuid.uuid4())
-        has_streamed = False
         async for event in events:
             texts = extract_event_text(event)
             if is_final(event):
                 final_text = "".join(texts)
             else:
-                for t in texts:
-                    streamed.append(t)
-                    await updater.add_artifact(
-                        parts=[Part(text=t)], artifact_id=artifact_id, append=has_streamed
-                    )
-                    has_streamed = True
+                streamed.extend(texts)
         return final_text or "".join(streamed)
-
-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # ADK's in-memory Runner has no mid-run cancellation hook; the A2A
-        # framework marks the task cancelled. Nothing to tear down here.
-        logger.info("google-adk: cancel requested for context %s", getattr(context, "context_id", "?"))

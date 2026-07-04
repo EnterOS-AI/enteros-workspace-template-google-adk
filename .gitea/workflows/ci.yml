@@ -428,18 +428,19 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      # pyyaml is the runtime dep that adapter.py's _load_providers reads
-      # /configs/config.yaml through. In production it arrives transitively
-      # via molecule-ai-workspace-runtime; in this minimal test env we
-      # install it explicitly so the YAML-loading code path is actually
-      # exercised (without it, _load_providers' broad except-Exception
-      # swallows the ImportError and silently falls back to _BUILTIN_PROVIDERS,
-      # which is exactly the behavior that bit us 2026-04-30 when CI
-      # claimed green on a build that couldn't route any third-party model).
-      - run: pip install -q pytest pytest-asyncio pyyaml
+      # Install the REAL molecules-workspace-runtime (private index), not stubs.
+      # tenant-agent BUG 3: google_adk_executor.py now inherits the shared
+      # SubprocessA2AExecutor base from the runtime, so the session/history +
+      # pure-helper tests must exercise the REAL base (the SSOT), mirroring
+      # template-openclaw #139's Adapter-unit-tests job. Those two test modules
+      # `importorskip` the base, so this job stays GREEN (they skip) on a runtime
+      # too old to carry it and runs them for real once runtime #222 releases —
+      # the runtime-independent _routing / Dockerfile tests run either way.
+      # pyyaml/python-multipart are transitive runtime deps kept explicit so the
+      # YAML/upload code paths import (the 2026-04-30 silent-fallback guard).
+      - run: pip install -q pytest pytest-asyncio pyyaml python-multipart && pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       # Tests live under tests/ with their own pytest.ini that anchors
       # rootdir there — keeps pytest from importing the package
       # __init__.py (which does `from .adapter import ...` for runtime
-      # discovery and can't be satisfied without molecule_runtime
-      # installed). See tests/pytest.ini for the full rationale.
+      # discovery). See tests/pytest.ini for the full rationale.
       - run: python3 -m pytest tests/ -v
