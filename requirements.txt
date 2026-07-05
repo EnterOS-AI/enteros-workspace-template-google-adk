@@ -3,7 +3,7 @@
 # `molecules-workspace-runtime` (dependency-confusion fix #51): the new name is
 # 404 on public PyPI, so it resolves ONLY from our Gitea registry. Pinned to
 # match .runtime-version (the image RUNTIME_VERSION build-arg upgrades to it).
-molecules-workspace-runtime==0.3.87
+molecules-workspace-runtime==0.3.88
 
 # Pin a2a-sdk to 1.0.3 — the version the rest of the fleet actually runs
 # (verified live: claude-code workspaces are on 1.0.3 and extract incoming
